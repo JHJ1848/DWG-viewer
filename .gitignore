@@ -15,4 +15,7 @@ coverage/
 # Local large test DWG files
 /*.dwg
 public/samples/*副本*
+.cache/
+.playwright-cli/
+public/assets/aistudio/
 

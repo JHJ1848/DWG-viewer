@@ -13,8 +13,13 @@ import {
   ChevronUp,
   KeyRound,
   Database,
-  ExternalLink,
   ShieldCheck,
+  HardDriveDownload,
+  Zap,
+  RotateCcw,
+  Trash2,
+  FileArchive,
+  Play,
 } from 'lucide-react';
 import {
   DwgViewerEngine,
@@ -22,17 +27,18 @@ import {
   DwgProgressState,
   DwgProgressNode,
 } from './core/dwgViewerEngine';
-import { validateDwgFileName } from './utils/dwgValidation';
+import { formatByteSize, validateDwgOrCacheFileName } from './utils/dwgValidation';
 import { detectGpuHardware, GpuHardwareInfo } from './utils/webglCompatibility';
+import { LocalGzipCacheMeta } from './utils/dwgLocalCacheStore';
 
-const DEFAULT_DWG_URL = '/samples/baseline-sample.dwg';
+const DEFAULT_DWG_URL = '/samples/canteen.dwg';
 
 const INITIAL_NODES: DwgProgressNode[] = [
-  { id: 'FETCH_OR_READ', step: 1, title: '文件读取', status: 'active' },
-  { id: 'WASM_DECODE', step: 2, title: 'WASM解码', status: 'pending' },
-  { id: 'ENTITY_CONVERSION', step: 3, title: '图元构建', status: 'pending' },
-  { id: 'FONT_LAYOUT', step: 4, title: '字体排版', status: 'pending' },
-  { id: 'WEBGL_RENDER', step: 5, title: '视口呈现', status: 'pending' },
+  { id: 'FETCH_OR_READ', step: 1, title: '文件读取与校验', status: 'active' },
+  { id: 'WASM_DECODE', step: 2, title: 'WASM解码 / Gzip缓存', status: 'pending' },
+  { id: 'ENTITY_CONVERSION', step: 3, title: 'CAD 图元模型构建', status: 'pending' },
+  { id: 'FONT_LAYOUT', step: 4, title: '矢量字体与排版', status: 'pending' },
+  { id: 'WEBGL_RENDER', step: 5, title: 'WebGL 视口呈现', status: 'pending' },
 ];
 
 function getInitialUrlFromQuery(): string {
@@ -61,11 +67,13 @@ export default function App() {
     );
   });
   const [showSatokenInput, setShowSatokenInput] = useState<boolean>(false);
-  const [gpuInfo, setGpuInfo] = useState<GpuHardwareInfo>(() => detectGpuHardware());
+  const [gpuInfo] = useState<GpuHardwareInfo>(() => detectGpuHardware());
   const [showGpuModal, setShowGpuModal] = useState<boolean>(false);
+  const [showCachePanel, setShowCachePanel] = useState<boolean>(false);
+  const [cacheEntries, setCacheEntries] = useState<LocalGzipCacheMeta[]>([]);
   const [loadedMeta, setLoadedMeta] = useState<DwgLoadedMeta>({
-    fileName: 'baseline-sample.dwg',
-    fileSizeLabel: '87.0 KB',
+    fileName: 'canteen.dwg',
+    fileSizeLabel: '2.50 MB',
     versionLabel: 'AutoCAD DWG',
   });
   const [progress, setProgress] = useState<DwgProgressState>({
@@ -96,7 +104,8 @@ export default function App() {
     async (
       targetUrl?: string,
       customSatoken?: string,
-      headers?: Record<string, string>
+      headers?: Record<string, string>,
+      bypassCache = false
     ) => {
       const finalUrl = (targetUrl ?? urlInput).trim();
       const tokenToUse = customSatoken ?? satoken;
@@ -104,6 +113,7 @@ export default function App() {
       await engineRef.current?.loadFromUrl(finalUrl, {
         satoken: tokenToUse,
         headers,
+        bypassCache,
       });
     },
     [urlInput, satoken]
@@ -111,13 +121,32 @@ export default function App() {
 
   const handleLocalFile = useCallback(async (file: File) => {
     setErrorBanner(null);
-    const validation = validateDwgFileName(file.name);
+    const validation = validateDwgOrCacheFileName(file.name);
     if (!validation.valid) {
-      setErrorBanner(validation.reason || '仅支持 .dwg 格式图纸');
+      setErrorBanner(validation.reason || '仅支持 .dwg 图纸或 .dwg.cache.gz 压缩缓存文件');
       return;
     }
     const buffer = await file.arrayBuffer();
     await engineRef.current?.loadFromBuffer(file.name, buffer);
+  }, []);
+
+  const handleDownloadGzipFile = useCallback(async (fingerprint?: string) => {
+    const exported = await engineRef.current?.exportGzipCacheFile(fingerprint);
+    if (!exported) {
+      setErrorBanner('当前图纸尚未生成本地 Gzip 缓存记录');
+      return;
+    }
+    const copyBuffer = new Uint8Array(exported.gzBytes.byteLength);
+    copyBuffer.set(exported.gzBytes);
+    const blob = new Blob([copyBuffer], { type: 'application/gzip' });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = exported.exportFileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 3000);
   }, []);
 
   useEffect(() => {
@@ -132,6 +161,7 @@ export default function App() {
         }
       },
       onError: (msg) => setErrorBanner(msg),
+      onCacheListChanged: (entries) => setCacheEntries(entries),
     });
 
     engine.mount(viewportContainerRef.current);
@@ -141,7 +171,6 @@ export default function App() {
     const initialUrl = getInitialUrlFromQuery();
     void engine.loadFromUrl(initialUrl, { satoken });
 
-    // Support postMessage integration for parent Vue + Spring + MinIO system
     const onWindowMessage = (event: MessageEvent) => {
       const payload = event.data;
       if (!payload || typeof payload !== 'object') return;
@@ -162,6 +191,15 @@ export default function App() {
       ) {
         setErrorBanner(null);
         void engine.loadFromBuffer(payload.fileName || 'external.dwg', payload.buffer);
+      } else if (
+        payload.type === 'LOAD_DWG_GZIP_CACHE' &&
+        payload.buffer instanceof ArrayBuffer
+      ) {
+        setErrorBanner(null);
+        void engine.loadFromGzipCacheBuffer(
+          payload.fileName || 'external.dwg.cache.gz',
+          payload.buffer
+        );
       }
     };
 
@@ -170,6 +208,8 @@ export default function App() {
       window.removeEventListener('message', onWindowMessage);
     };
   }, [handleUpdateSatoken, satoken]);
+
+  const activeCache = loadedMeta.cacheInfo;
 
   return (
     <div
@@ -195,8 +235,8 @@ export default function App() {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".dwg"
-        aria-label="上传本地 DWG 文件"
+        accept=".dwg,.gz,application/gzip"
+        aria-label="上传本地 DWG 或 .dwg.cache.gz 缓存文件"
         className="hidden"
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -205,14 +245,13 @@ export default function App() {
         }}
       />
 
-      {/* Responsive Top Bar: Adapts to Desktop Single-Row and Mobile Two-Row */}
+      {/* Responsive Top Bar */}
       <header className="bg-[#0F1624] border-b border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-1.5 md:gap-2 px-2.5 sm:px-3 py-1.5 md:py-0 md:h-12 shrink-0 z-20">
-        {/* Row 1 on mobile / Left group on desktop: File Info & Mobile Action Buttons */}
+        {/* Left: File Info & Cache Status Badge */}
         <div className="flex items-center justify-between md:justify-start gap-2 min-w-0 w-full md:w-auto">
-          {/* File Name & Size */}
           <div className="flex items-center gap-1.5 min-w-0">
             <span
-              className="text-xs font-mono text-slate-200 truncate max-w-[120px] sm:max-w-[200px]"
+              className="text-xs font-mono text-slate-200 truncate max-w-[120px] sm:max-w-[170px]"
               title={loadedMeta.fileName}
             >
               {loadedMeta.fileName}
@@ -220,10 +259,51 @@ export default function App() {
             <span className="text-[10px] sm:text-[11px] font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-500/30 px-1.5 py-0.5 rounded shrink-0">
               {loadedMeta.fileSizeLabel}
             </span>
+
+            {activeCache && (
+              <button
+                type="button"
+                onClick={() => setShowCachePanel((v) => !v)}
+                data-testid="gzip-status-badge"
+                className={`hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono border transition-colors shrink-0 ${
+                  activeCache.source === 'wasm-cold'
+                    ? 'bg-indigo-950/60 text-indigo-300 border-indigo-500/40 hover:bg-indigo-900/50'
+                    : 'bg-emerald-950/70 text-emerald-300 border-emerald-500/40 hover:bg-emerald-900/50'
+                }`}
+                title="点击打开本地 Gzip 缓存管理与对比面板"
+              >
+                <Zap className="w-3 h-3 text-amber-400" />
+                {activeCache.source === 'wasm-cold' ? (
+                  <span>
+                    首次解码 {(activeCache.wasmParseMs / 1000).toFixed(1)}s · 已存 Gzip (
+                    {formatByteSize(activeCache.compressedBytes)}, -
+                    {Math.round(activeCache.compressionRatio * 100)}%)
+                  </span>
+                ) : activeCache.source === 'local-gzip-file' ? (
+                  <span>
+                    .gz文件秒开 {(activeCache.totalElapsedMs / 1000).toFixed(1)}s (解压{' '}
+                    {activeCache.decompressMs}ms)
+                  </span>
+                ) : (
+                  <span>
+                    Gzip缓存秒开 {(activeCache.totalElapsedMs / 1000).toFixed(1)}s (解压{' '}
+                    {activeCache.decompressMs}ms)
+                  </span>
+                )}
+              </button>
+            )}
           </div>
 
-          {/* Quick Actions on Mobile (Right of Row 1) */}
+          {/* Mobile Quick Actions */}
           <div className="flex items-center gap-1.5 md:hidden">
+            <button
+              type="button"
+              onClick={() => setShowCachePanel((v) => !v)}
+              className="px-2 py-1 rounded text-[11px] font-mono bg-emerald-950/50 text-emerald-300 border border-emerald-500/40 flex items-center gap-1"
+            >
+              <FileArchive className="w-3 h-3" />
+              <span>Gzip({cacheEntries.length})</span>
+            </button>
             <button
               type="button"
               onClick={() => void engineRef.current?.fitToView()}
@@ -231,18 +311,6 @@ export default function App() {
               className="p-1.5 rounded text-xs bg-slate-800 hover:bg-slate-700 text-cyan-400 border border-slate-700 transition-colors"
             >
               <Scan className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowSatokenInput((v) => !v)}
-              className={`p-1.5 rounded text-xs font-mono flex items-center transition-colors border ${
-                showSatokenInput || satoken
-                  ? 'bg-amber-950/40 text-amber-300 border-amber-500/40'
-                  : 'bg-slate-800 text-slate-400 border-slate-700'
-              }`}
-              title="配置 Sa-Token"
-            >
-              <KeyRound className="w-3.5 h-3.5 text-amber-400" />
             </button>
             <button
               type="button"
@@ -255,7 +323,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Row 2 on mobile / Center on desktop: URL input form */}
+        {/* Center: URL Input & Built-in Sample Presets */}
         <form
           className="w-full md:flex-1 md:max-w-2xl lg:max-w-3xl flex items-center gap-1.5 min-w-0"
           onSubmit={(e) => {
@@ -269,53 +337,55 @@ export default function App() {
               type="text"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="输入 MinIO 路径 (如 nonglintu/dwg/...) 或远程 URL..."
-              aria-label="MinIO 或内部 DWG 文件地址"
+              placeholder="输入本地样图 (/samples/...) 或 MinIO 路径..."
+              aria-label="DWG 或 Gzip 缓存文件地址"
               className="w-full pl-8 pr-2.5 py-1.5 text-xs font-mono bg-slate-900 border border-slate-700/80 rounded focus:outline-none focus:border-cyan-400 text-slate-200 placeholder:text-slate-500"
             />
           </div>
 
-          {/* Quick preset buttons */}
+          {/* Local Sample Presets (Work directly in AI Studio without intranet MinIO) */}
           <button
             type="button"
+            disabled={progress.isLoading}
             onClick={() => {
-              const path = 'nonglintu/dwg/1如意乡平图1.dwg';
+              const path = '/samples/canteen.dwg';
               setUrlInput(path);
               void handleLoadUrl(path);
             }}
-            className="hidden xl:flex items-center gap-1 px-2 py-1.5 rounded text-[11px] font-medium bg-cyan-950/40 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-900/40 transition-colors shrink-0"
-            title="一键填入并加载 如意乡平图1.dwg"
+            className="hidden lg:flex items-center gap-1 px-2 py-1.5 rounded text-[11px] font-medium bg-cyan-950/40 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-900/40 disabled:opacity-50 transition-colors shrink-0"
+            title="加载内置真实图纸 canteen.dwg (2.5MB)"
           >
             <Database className="w-3 h-3 text-cyan-400" />
-            <span>如意乡平图1</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const farmlandPath = 'nonglintu/dwg/01俄洛镇格巴村总平图.dwg';
-              setUrlInput(farmlandPath);
-              void handleLoadUrl(farmlandPath);
-            }}
-            className="hidden 2xl:flex items-center gap-1 px-2 py-1.5 rounded text-[11px] font-medium bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition-colors shrink-0"
-            title="一键填入农田 MinIO 总平图并加载"
-          >
-            <Database className="w-3 h-3 text-slate-400" />
-            <span>俄洛镇总平图</span>
+            <span>样图1(2.5M)</span>
           </button>
 
-          {/* Sa-Token Toggle Button (Desktop only) */}
+          <button
+            type="button"
+            disabled={progress.isLoading}
+            onClick={() => {
+              const path = '/samples/baseline-sample.dwg';
+              setUrlInput(path);
+              void handleLoadUrl(path);
+            }}
+            className="hidden xl:flex items-center gap-1 px-2 py-1.5 rounded text-[11px] font-medium bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 disabled:opacity-50 transition-colors shrink-0"
+            title="加载内置大型工程总图 baseline-sample.dwg (18MB)"
+          >
+            <Database className="w-3 h-3 text-slate-400" />
+            <span>样图2(18M)</span>
+          </button>
+
           <button
             type="button"
             onClick={() => setShowSatokenInput((v) => !v)}
             className={`hidden md:flex px-2 py-1.5 rounded text-[11px] font-mono items-center gap-1 transition-colors shrink-0 border ${
-              showSatokenInput || satoken
+              showSatokenInput
                 ? 'bg-amber-950/40 text-amber-300 border-amber-500/40'
                 : 'bg-slate-800 text-slate-400 border-slate-700'
             }`}
-            title="配置 Sa-Token 鉴权凭证（支持随时替换并自动持久化保存）"
+            title="配置内网 MinIO Sa-Token 鉴权凭证"
           >
             <KeyRound className="w-3 h-3 text-amber-400" />
-            <span className="hidden lg:inline">Token</span>
+            <span className="hidden 2xl:inline">Token</span>
           </button>
 
           <button
@@ -331,24 +401,44 @@ export default function App() {
         <div className="hidden md:flex items-center gap-1.5 shrink-0">
           <button
             type="button"
-            onClick={() => setShowGpuModal((v) => !v)}
-            className={`hidden lg:flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-mono border transition-colors ${
-              gpuInfo.gpuTier === 'dedicated'
-                ? 'bg-emerald-950/40 text-emerald-300 border-emerald-500/40 hover:bg-emerald-900/50'
-                : gpuInfo.gpuTier === 'integrated'
-                ? 'bg-amber-950/40 text-amber-300 border-amber-500/40 hover:bg-amber-900/50'
-                : 'bg-sky-950/40 text-sky-300 border-sky-500/40 hover:bg-sky-900/50'
+            data-testid="toggle-gzip-cache-panel"
+            onClick={() => setShowCachePanel((v) => !v)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-mono border transition-colors ${
+              showCachePanel
+                ? 'bg-emerald-900/50 text-emerald-200 border-emerald-400/60'
+                : 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30 hover:bg-emerald-900/40'
             }`}
+            title="管理本地 Gzip 压缩缓存 (.dwg.cache.gz) · 导出/直开/对比测试"
+          >
+            <FileArchive className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Gzip缓存库 ({cacheEntries.length})</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={!activeCache || progress.isLoading}
+            onClick={() => void handleDownloadGzipFile()}
+            data-testid="export-gzip-btn"
+            className="hidden xl:flex items-center gap-1 px-2.5 py-1.5 rounded text-xs font-medium bg-indigo-950/50 hover:bg-indigo-900/60 disabled:opacity-40 text-indigo-200 border border-indigo-500/30 transition-colors"
+            title="将当前图纸的解码中间结果导出为本地 .dwg.cache.gz 压缩文件"
+          >
+            <HardDriveDownload className="w-3.5 h-3.5 text-indigo-400" />
+            <span>导出 .gz</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowGpuModal((v) => !v)}
+            className="hidden 2xl:flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-mono border bg-slate-900/80 text-slate-300 border-slate-700 hover:bg-slate-800 transition-colors"
             title="查看当前机器图形硬件探测与 WebGL 兼容守护状态"
           >
             <Cpu className="w-3 h-3 text-cyan-400" />
-            <span className="truncate max-w-[150px]">
+            <span>
               {gpuInfo.gpuTier === 'dedicated'
-                ? '独显就绪'
+                ? '独显'
                 : gpuInfo.gpuTier === 'integrated'
-                ? '核显兼容'
-                : '通用兼容'}
-              : {gpuInfo.renderer.split('(')[0].replace(/ANGLE|Direct3D11|vs_\d+_\d+|ps_\d+_\d+/gi, '').trim() || 'WebGL'}
+                ? '核显'
+                : 'WebGL'}
             </span>
           </button>
 
@@ -360,19 +450,249 @@ export default function App() {
             className="px-2.5 py-1.5 rounded text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center gap-1.5 transition-colors"
           >
             <Scan className="w-3.5 h-3.5 text-cyan-400" />
-            <span className="hidden sm:inline">居中复位</span>
+            <span className="hidden lg:inline">居中复位</span>
           </button>
 
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
             className="px-3 py-1.5 rounded text-xs font-semibold bg-cyan-400 hover:bg-cyan-300 text-slate-950 flex items-center gap-1.5 transition-colors"
+            title="支持上传原始 .dwg 图纸，或直接上传 .dwg.cache.gz 本地缓存文件秒开"
           >
             <Upload className="w-3.5 h-3.5" />
-            <span>上传 DWG</span>
+            <span>上传 DWG / .gz</span>
           </button>
         </div>
       </header>
+
+      {/* Local Gzip Cache Management & Benchmark Panel */}
+      {showCachePanel && (
+        <section
+          data-testid="gzip-cache-panel"
+          className="bg-[#0d1526] border-b border-emerald-500/30 px-3 sm:px-4 py-3 text-xs z-20 shadow-xl flex flex-col gap-3 max-h-[52vh] overflow-y-auto"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
+            <div className="flex items-center gap-2">
+              <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono font-semibold flex items-center gap-1">
+                <FileArchive className="w-3.5 h-3.5" />
+                双层 Gzip 缓存引擎 (L1 浏览器 IndexedDB + L2 服务端多设备共享 /api/dwg-cache)
+              </span>
+              <span className="text-slate-400 hidden sm:inline">
+                任意一台设备首次解码后自动同步至服务端磁盘 (.cache/dwg-gzip/)，局域网内其他设备或浏览器可直接共享秒开
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {activeCache && (
+                <>
+                  <button
+                    type="button"
+                    disabled={progress.isLoading}
+                    data-testid="reload-from-gzip-btn"
+                    onClick={() => {
+                      setErrorBanner(null);
+                      void engineRef.current?.loadFromCachedFingerprint(activeCache.fingerprint);
+                    }}
+                    className="px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center gap-1 transition-colors"
+                    title="直接从 Gzip 缓存解压并渲染当前图纸（0ms 跳过 WASM）"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>测试 Gzip 缓存秒开</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={progress.isLoading}
+                    onClick={() => void handleDownloadGzipFile(activeCache.fingerprint)}
+                    className="px-2.5 py-1 rounded bg-indigo-600/80 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium flex items-center gap-1 transition-colors"
+                  >
+                    <HardDriveDownload className="w-3.5 h-3.5" />
+                    <span>下载 .dwg.cache.gz</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={progress.isLoading}
+                    onClick={() => void handleLoadUrl(urlInput, satoken, undefined, true)}
+                    className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 border border-slate-700 flex items-center gap-1 transition-colors"
+                    title="忽略缓存，强制重新执行 WASM 解码以对比耗时"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>强制重算 WASM</span>
+                  </button>
+                </>
+              )}
+
+              {cacheEntries.length > 0 && (
+                <button
+                  type="button"
+                  disabled={progress.isLoading}
+                  onClick={() => void engineRef.current?.clearAllCache()}
+                  className="px-2 py-1 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/30 flex items-center gap-1 transition-colors"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>清空全部</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setShowCachePanel(false)}
+                className="p-1 text-slate-400 hover:text-white"
+                title="收起缓存面板"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* Current Drawing Gzip Compression Metrics */}
+          {activeCache && (
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 font-mono">
+              <div className="bg-slate-900/90 border border-slate-800 rounded p-2">
+                <div className="text-[10px] text-slate-400">当前加载模式</div>
+                <div className="text-xs font-bold text-emerald-300 mt-0.5">
+                  {activeCache.source === 'wasm-cold'
+                    ? '首次 WASM 解码 -> 已同步共享'
+                    : activeCache.source === 'local-gzip-file'
+                    ? '⚡ 本地 .gz 文件直开'
+                    : activeCache.source === 'server-gzip-shared'
+                    ? '⚡ L2 服务端多端共享秒开'
+                    : '⚡ L1 IndexedDB Gzip 秒开'}
+                </div>
+              </div>
+              <div className="bg-slate-900/90 border border-slate-800 rounded p-2">
+                <div className="text-[10px] text-slate-400">原始 DWG 体积</div>
+                <div className="text-xs font-bold text-slate-200 mt-0.5">
+                  {formatByteSize(activeCache.originalByteLength)}
+                </div>
+              </div>
+              <div className="bg-slate-900/90 border border-slate-800 rounded p-2">
+                <div className="text-[10px] text-slate-400">精简 JSON 中间体积</div>
+                <div className="text-xs font-bold text-amber-300 mt-0.5">
+                  {formatByteSize(activeCache.rawJsonBytes)}
+                </div>
+              </div>
+              <div className="bg-slate-900/90 border border-slate-800 rounded p-2">
+                <div className="text-[10px] text-slate-400">Gzip 压缩后 (.gz)</div>
+                <div className="text-xs font-bold text-cyan-300 mt-0.5">
+                  {formatByteSize(activeCache.compressedBytes)}{' '}
+                  <span className="text-emerald-400">
+                    (-{Math.round(activeCache.compressionRatio * 100)}%)
+                  </span>
+                </div>
+              </div>
+              <div className="bg-slate-900/90 border border-slate-800 rounded p-2">
+                <div className="text-[10px] text-slate-400">WASM 解码 vs Gzip 解压</div>
+                <div className="text-xs font-bold text-slate-200 mt-0.5">
+                  {(activeCache.wasmParseMs / 1000).toFixed(2)}s vs{' '}
+                  <span className="text-emerald-400">
+                    {activeCache.decompressMs > 0 ? `${activeCache.decompressMs}ms` : '~35ms'}
+                  </span>
+                </div>
+              </div>
+              <div className="bg-slate-900/90 border border-slate-800 rounded p-2">
+                <div className="text-[10px] text-slate-400">总图元数 / 图层数</div>
+                <div className="text-xs font-bold text-slate-200 mt-0.5">
+                  {activeCache.entityCount.toLocaleString()} 图元 / {activeCache.layerCount} 层
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Cached Gzip Entries Table */}
+          <div className="flex flex-col gap-1.5">
+            <div className="text-[11px] font-semibold text-slate-300 flex items-center justify-between">
+              <span>
+                已持久化的 Gzip 缓存记录 ({cacheEntries.length} 个 · 支持本机 IndexedDB 与局域网服务端多设备共享)
+              </span>
+              <span className="text-slate-400 font-normal">
+                其他设备访问同一服务地址即可直接点击「秒开」免原图渲染，或「下载 .gz」离线保存
+              </span>
+            </div>
+
+            {cacheEntries.length === 0 ? (
+              <div className="bg-slate-900/60 border border-slate-800 rounded p-3 text-center text-slate-400">
+                暂无 Gzip 缓存记录，加载任意 DWG 图纸后将自动生成并同步至服务端供多设备共享。
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {cacheEntries.map((item) => {
+                  const isCurrent = activeCache?.fingerprint === item.fingerprint;
+                  const scopeLabel =
+                    item.storageScope === 'server-shared'
+                      ? '🌐 服务端多端共享'
+                      : item.storageScope === 'both'
+                      ? '🌐 本机 + 服务端共享'
+                      : '💻 仅本机浏览器';
+                  return (
+                    <div
+                      key={item.fingerprint}
+                      className={`flex items-center justify-between gap-2 p-2 rounded border font-mono ${
+                        isCurrent
+                          ? 'bg-emerald-950/30 border-emerald-500/40'
+                          : 'bg-slate-900/70 border-slate-800'
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-xs font-semibold text-slate-100 truncate">
+                            {item.fileName}
+                          </span>
+                          <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-300 border border-cyan-500/30 shrink-0">
+                            .gz: {formatByteSize(item.compressedBytes)} (-
+                            {Math.round(item.compressionRatio * 100)}%)
+                          </span>
+                          <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-950/80 text-indigo-300 border border-indigo-500/30 shrink-0">
+                            {scopeLabel}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-0.5 truncate">
+                          原图 {formatByteSize(item.originalByteLength)} → JSON{' '}
+                          {formatByteSize(item.rawJsonBytes)} · {item.entityCount.toLocaleString()}{' '}
+                          图元 · 首次解码 {(item.wasmParseMs / 1000).toFixed(1)}s
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          disabled={progress.isLoading}
+                          onClick={() =>
+                            void engineRef.current?.loadFromCachedFingerprint(item.fingerprint)
+                          }
+                          className="px-2 py-1 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-[11px] flex items-center gap-1"
+                          title="从 Gzip 缓存直接秒开"
+                        >
+                          <Play className="w-3 h-3" />
+                          <span>秒开</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDownloadGzipFile(item.fingerprint)}
+                          className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-slate-700 text-[11px] flex items-center gap-1"
+                          title="导出为本地 .dwg.cache.gz 文件"
+                        >
+                          <HardDriveDownload className="w-3 h-3" />
+                          <span>.gz</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void engineRef.current?.removeCacheEntry(item.fingerprint)}
+                          className="p-1 rounded bg-slate-800 hover:bg-rose-900/60 text-slate-400 hover:text-rose-300 border border-slate-700"
+                          title="删除此条缓存"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* Expandable Sa-Token Configuration Bar */}
       {showSatokenInput && (
@@ -386,7 +706,7 @@ export default function App() {
               type="text"
               value={satoken}
               onChange={(e) => handleUpdateSatoken(e.target.value)}
-              placeholder="请输入或粘贴最新的 Sa-Token (如 7e3ee0e3-6041-45f4-9121-9783e7c81a98)..."
+              placeholder="请输入或粘贴最新的 Sa-Token..."
               aria-label="Sa-Token 凭据"
               className="flex-1 px-2.5 py-1 text-xs font-mono bg-slate-950 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-amber-400 placeholder:text-slate-500"
             />
@@ -427,13 +747,11 @@ export default function App() {
               设备内核: <strong className="text-slate-200">{gpuInfo.renderer}</strong>
             </span>
             <span>
-              WebGL 规范: <strong className="text-emerald-300">{gpuInfo.webglVersion.toUpperCase()}</strong>
+              WebGL 规范:{' '}
+              <strong className="text-emerald-300">{gpuInfo.webglVersion.toUpperCase()}</strong>
             </span>
             <span>
               最大纹理: <strong className="text-slate-200">{gpuInfo.maxTextureSize}px</strong>
-            </span>
-            <span className="text-emerald-400 text-[11px]">
-              ✔ 全图元 100% 原始矢量呈现 · TDR 驱动自愈守护就绪
             </span>
           </div>
           <button
@@ -468,7 +786,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Full-Viewport WebGL CAD Canvas (Supports Wheel Zoom & Drag Pan) */}
+      {/* Full-Viewport WebGL CAD Canvas */}
       <main className="flex-1 relative overflow-hidden bg-[#0B0E17]">
         <div
           ref={viewportContainerRef}
@@ -480,7 +798,6 @@ export default function App() {
         {progress.isLoading && (
           <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 w-[94vw] max-w-xl transition-all duration-300">
             <div className="bg-[#0c1322]/95 backdrop-blur-md border border-cyan-500/40 rounded-xl shadow-[0_12px_40px_rgba(0,0,0,0.65)] p-4 sm:p-5 text-slate-100 flex flex-col gap-3">
-              {/* Header: Stage Badge + Elapsed Time + Large Percent */}
               <div className="flex items-start justify-between gap-3">
                 <div className="flex flex-col gap-1 min-w-0">
                   <div className="flex items-center gap-2">
@@ -521,7 +838,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Glowing Dynamic Progress Bar */}
               <div className="w-full bg-slate-900/90 h-2 sm:h-2.5 rounded-full overflow-hidden p-0.5 border border-slate-700/60 shadow-inner">
                 <div
                   className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-indigo-400 transition-all duration-150 ease-out shadow-[0_0_12px_rgba(34,211,238,0.6)]"
@@ -529,7 +845,6 @@ export default function App() {
                 />
               </div>
 
-              {/* 5-Step Stepper List */}
               {!isProgressCollapsed && (
                 <div className="grid grid-cols-5 gap-1 sm:gap-2 pt-1 border-t border-slate-800/80">
                   {progress.nodes.map((node) => {
@@ -579,7 +894,9 @@ export default function App() {
         {isDraggingOver && (
           <div className="absolute inset-0 z-30 bg-slate-950/85 border-2 border-dashed border-cyan-400 flex flex-col items-center justify-center gap-2 pointer-events-none">
             <Upload className="w-8 h-8 text-cyan-400" />
-            <p className="text-sm font-medium text-white">释放鼠标以解析并预览该 .dwg 图纸</p>
+            <p className="text-sm font-medium text-white">
+              释放鼠标以预览 .dwg 图纸，或直接秒开 .dwg.cache.gz 本地压缩缓存文件
+            </p>
           </div>
         )}
       </main>

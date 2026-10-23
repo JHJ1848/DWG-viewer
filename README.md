@@ -296,14 +296,15 @@ watch(
 4. **`LWPOLYLINE` 闭合位兼容（`512` -> `1`）**：
    - **处理**：将 LibreDWG 的 `flag & 512` 同步置位到 `flag |= 1`，确保闭合网格与闭合多段线不丢最后一段闭合边。
 
+### 已落地的双层 Gzip 缓存引擎（L1 浏览器 IndexedDB + L2 服务端多设备共享）
+1. **DWG 指纹计算 (`computeDwgFingerprint`)**：对 DWG 二进制流采样（头 64KB + 中部 64KB + 尾 64KB + 文件字节长度）计算 FNV-1a 64-bit 指纹（如 `dwg-v1-a8d08bf36d57fb06-226576`），耗时 `< 1ms`。
+2. **DWG 中间 JSON 瘦身 (`stripDwgDatabaseForCache`)**：自动剔除 `@mlightcad/libredwg-web` 在顶层 `db.entities` 与 `BLOCK_RECORD.entities` 之间重复生成的冗余模型空间实体引用及无用 `xdata`，在零损画质前提下将序列化 JSON 体积缩减约 `45%`~`55%`。
+3. **双层 Gzip 缓存读写 (`src/utils/dwgGzipCache.ts` + `src/utils/dwgLocalCacheStore.ts` + `server.ts`)**：
+   - **L1 浏览器本地缓存**：基于 Web 原生 `CompressionStream('gzip')` / `DecompressionStream('gzip')` 与 `IndexedDB`，单机二次打开跳过 `libredwg-web.wasm` 二进制解码。
+   - **L2 服务端共享缓存 (`/api/dwg-cache/:fingerprint`)**：服务端将 `.dwg.json.gz` 与 `.meta.json` 持久化在 `.cache/dwg-gzip/` 目录（后续可无缝替换为 Spring Boot + MinIO 对象存储），一人首次解析后，局域网或多设备首次打开同一图纸即可直接拉取 L2 Gzip 缓存并回填本地 L1 IndexedDB，实现跨设备秒开。
+
 ### 后续待办清单 (TODO)
 
-#### TODO 1：中间数据 (`DwgDatabase` JSON) 持久化与二次秒开
-- **核心思路**：`libredwgParserWorker.ts` 中 `const result = instance.convertEx(dwg)` 生成的 `result.database` 是已经完成 WASM 二进制解码的**纯 JSON 对象**。
-- **实现步骤**：
-  1. **首次解析后上传中间数据**：在 Worker 返回 `result.database` 后，使用浏览器原生 `CompressionStream('gzip')` 将 `JSON.stringify(result.database)` 压缩为 `.dwg.json.gz`（体积约为原 DWG 的 15%~25%），通过 Spring Boot 接口存入 MinIO（例如 `${fileId}.parsed.json.gz`）或缓存在浏览器 `IndexedDB` 中。
-  2. **二次打开跳过 WASM 解码**：打开图纸前先检查 MinIO 是否存在对应的 `.parsed.json.gz`；若存在，前端直接拉取解压得到 `database` JSON 对象并在 Worker 中直接返回 `{ model: database, data: stats }`，即可完全跳过最耗时的 `LibreDwg.dwg_read_data` + `convertEx` 阶段。
-
-#### TODO 2：特殊测量网格图元扩展（按需补充）
+#### TODO：特殊测量网格图元扩展（按需补充）
 - **`DWG_TYPE_MINSERT` (固定类型 `8`，块矩形阵列)**：部分测绘院图纸使用 `MINSERT` 生成十字丝坐标网格。若遇到此类图纸网格缺失，可在 Worker 中将 `MINSERT` 展开为 `num_rows × num_cols` 个普通 `INSERT` 图元推入 `result.database.entities`。
 - **`DWG_TYPE_XLINE` / `DWG_TYPE_RAY` (构造线 / 射线)**：部分建筑轴网使用无限长构造线 `XLINE`，可在 Worker 中按图纸包围盒范围将其裁剪转换为普通 `LINE` 线段以供预览。

@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/patch-ole-rasterizer.cjs && vite --port=3000 --host=0.0.0.0 --force",
+    "dev": "node scripts/patch-ole-rasterizer.cjs && tsx server.ts",
+    "start": "tsx server.ts",
     "build": "node scripts/patch-ole-rasterizer.cjs && vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",

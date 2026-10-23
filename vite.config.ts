@@ -22,7 +22,7 @@ export default defineConfig(() => {
         'Cache-Control': 'no-cache, no-store, must-revalidate',
       },
       proxy: {
-        '/api': {
+        '/api/system': {
           target: 'http://192.168.81.163:9008',
           changeOrigin: true,
         },

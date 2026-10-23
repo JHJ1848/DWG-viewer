@@ -1,9 +1,6 @@
 import { AcDbBaseWorker } from '@mlightcad/data-model';
 import { Dwg_File_Type, LibreDwg } from '@mlightcad/libredwg-web';
 
-const DB_NAME = 'cadlight_dwg_cache_v6';
-const STORE_NAME = 'parsed_models';
-
 const BIG_FONTS = new Set([
   'hztxt',
   'gbcbig',
@@ -235,91 +232,8 @@ function normalizeInlineMTextFontCodes(ent: any) {
   }
 }
 
-function openCacheDb(): Promise<IDBDatabase | null> {
-  return new Promise((resolve) => {
-    if (typeof indexedDB === 'undefined') return resolve(null);
-    try {
-      const request = indexedDB.open(DB_NAME, 1);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          db.createObjectStore(STORE_NAME, { keyPath: 'hash' });
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => resolve(null);
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-async function getCachedModel(hash: string): Promise<any | null> {
-  const db = await openCacheDb();
-  if (!db) return null;
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.get(hash);
-      req.onsuccess = () => {
-        if (req.result && req.result.model) {
-          resolve(req.result);
-        } else {
-          resolve(null);
-        }
-      };
-      req.onerror = () => resolve(null);
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-async function saveCachedModel(hash: string, model: any, stats: any): Promise<void> {
-  const db = await openCacheDb();
-  if (!db) return;
-  try {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    store.put({
-      hash,
-      model,
-      stats,
-      cachedAt: Date.now(),
-    });
-  } catch (err) {
-    console.warn('[Cache] IndexedDB save failed:', err);
-  }
-}
-
 /**
- * Computes ultra-fast 64-bit sampling fingerprint of ArrayBuffer (< 0.1ms)
- */
-function computeQuickBufferHash(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  let h1 = 0x811c9dc5;
-  let h2 = 0x5b793fb7;
-  const sampleIndices = [
-    0, Math.min(len, 128),
-    Math.floor(len / 2), Math.min(len, Math.floor(len / 2) + 128),
-    Math.max(0, len - 128), len,
-  ];
-  for (let s = 0; s < sampleIndices.length; s += 2) {
-    const start = sampleIndices[s];
-    const end = sampleIndices[s + 1];
-    for (let i = start; i < end; i++) {
-      h1 ^= bytes[i];
-      h1 = Math.imul(h1, 0x01000193);
-      h2 ^= bytes[i];
-      h2 = Math.imul(h2, 0x5bd1e995);
-    }
-  }
-  return `dwg_${len}_${(h1 >>> 0).toString(16)}_${(h2 >>> 0).toString(16)}`;
-}
 
-/**
  * Normalizes a parsed LibreDWG database for 2D CAD viewport rendering:
  * 1. Keeps non-plottable layers (plotFlag = 0, commonly used for coordinate grids,
  *    construction lines, and Defpoints) visible on screen just like AutoCAD's viewport.
@@ -333,6 +247,13 @@ function normalizeEntityList(entities: any[] | undefined) {
   for (let i = 0; i < entities.length; i++) {
     const ent = entities[i];
     if (!ent || typeof ent !== 'object') continue;
+
+    // Strip entity-level XData (Extended Data binary/handle blobs).
+    // AcDbLibreDwgConverter only copies entity.xdata for DXF export and never uses it for 2D WebGL rendering.
+    // Removing entity.xdata eliminates >60% of JSON bloat and BigInt/Uint8Array allocations on large drawings.
+    if ('xdata' in ent) {
+      delete ent.xdata;
+    }
 
     if (typeof ent.elevation === 'number') {
       ent.elevation = 0;
@@ -443,40 +364,53 @@ function normalizeDwgDatabaseFor2DPreview(db: any) {
     }
   }
 
-  // 2. Normalize text styles: strip path/extension, fix bigfont hijacking, fallback to arial
+  // 2. Normalize text styles: strip path/extension, fix bigfont hijacking, fallback to simplex
   normalizeStyleEntries(db.tables?.STYLE?.entries);
 
-  // 3. Normalize ModelSpace entities and all Block table records
-  normalizeEntityList(db.entities);
+  // 3. Normalize Block table records and deduplicate top-level db.entities
+  // LibreDWG's convertEx populates ModelSpace entities into BOTH db.entities AND
+  // db.tables.BLOCK_RECORD.entries['*Model_Space'].entities, while AcDbLibreDwgConverter
+  // ONLY reads db.tables.BLOCK_RECORD.entries. Clearing db.entities when *Model_Space
+  // is present cuts serialized JSON & memory size in half (2x reduction).
   const blockEntries = db.tables?.BLOCK_RECORD?.entries;
+  let hasModelSpaceBlockEntities = false;
   if (Array.isArray(blockEntries)) {
     for (const block of blockEntries) {
       if (block && Array.isArray(block.entities)) {
         normalizeEntityList(block.entities);
+        const bName = String(block.name || '').toUpperCase();
+        if (bName.includes('MODEL_SPACE') && block.entities.length > 0) {
+          hasModelSpaceBlockEntities = true;
+        }
       }
     }
   }
+
+  if (hasModelSpaceBlockEntities) {
+    db.entities = [];
+  } else {
+    normalizeEntityList(db.entities);
+  }
+}
+
+let libreDwgInstancePromise: Promise<any> | null = null;
+
+function getLibreDwgInstance() {
+  if (!libreDwgInstancePromise) {
+    libreDwgInstancePromise = LibreDwg.create('/wasm');
+  }
+  return libreDwgInstancePromise;
 }
 
 /**
  * Official @mlightcad/libredwg-converter Web Worker entry point
- * configured to load libredwg-web.wasm from the local /wasm directory
- * with built-in IndexedDB persistent caching for instant second opens.
+ * configured to load libredwg-web.wasm from the local /wasm directory.
+ * Note: Gzip persistent caching (IndexedDB + .dwg.cache.gz file export/import)
+ * is intercepted upstream in CachedLibreDwgConverter before worker invocation.
  */
 class AcDbLibreDwgParserWorker extends AcDbBaseWorker<ArrayBuffer, unknown> {
   protected async executeTask(data: ArrayBuffer) {
-    const cacheKey = computeQuickBufferHash(data);
-    const cached = await getCachedModel(cacheKey);
-    if (cached) {
-      console.log(`[DWG Cache] 命中 IndexedDB 本地秒开缓存: ${cacheKey}`);
-      return {
-        model: cached.model,
-        data: cached.stats,
-        fromCache: true,
-      };
-    }
-
-    const instance = await LibreDwg.create('/wasm');
+    const instance = await getLibreDwgInstance();
     const dwg = instance.dwg_read_data(data, Dwg_File_Type.DWG);
     if (dwg == null) {
       throw new Error('LibreDWG 无法解析该 DWG 文件头或实体结构。');
@@ -485,7 +419,6 @@ class AcDbLibreDwgParserWorker extends AcDbBaseWorker<ArrayBuffer, unknown> {
     enrichStylesFromRawDwg(instance, dwg, result.database);
     instance.dwg_free(dwg);
     normalizeDwgDatabaseFor2DPreview(result.database);
-    void saveCachedModel(cacheKey, result.database, result.stats);
     return {
       model: result.database,
       data: result.stats,
@@ -494,4 +427,5 @@ class AcDbLibreDwgParserWorker extends AcDbBaseWorker<ArrayBuffer, unknown> {
 }
 
 new AcDbLibreDwgParserWorker();
+
 

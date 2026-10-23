@@ -40,6 +40,32 @@ export function validateDwgFileName(fileName: string): DwgValidationResult {
 }
 
 /**
+ * Validates that a file name is either a standard .dwg drawing or a Gzip-compressed DWG cache (.dwg.cache.gz / .gz).
+ */
+export function validateDwgOrCacheFileName(fileName: string): DwgValidationResult {
+  const trimmed = (fileName || '').trim();
+  if (!trimmed) {
+    return { valid: false, reason: '文件名不能为空' };
+  }
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.endsWith('.dwg') ||
+    lower.endsWith('.dwg.cache.gz') ||
+    lower.endsWith('.cache.gz') ||
+    lower.endsWith('.dwg.gz') ||
+    lower.endsWith('.gz')
+  ) {
+    return { valid: true };
+  }
+  const ext = trimmed.includes('.') ? `.${trimmed.split('.').pop()}` : '未知格式';
+  return {
+    valid: false,
+    reason: `格式不受支持 (${ext})：仅支持 AutoCAD .dwg 图纸或 .dwg.cache.gz 本地压缩缓存文件`,
+  };
+}
+
+
+/**
  * Reads the first 6 bytes of a DWG binary buffer to identify its AutoCAD version signature.
  */
 export function inspectDwgHeader(buffer: ArrayBuffer | Uint8Array): DwgHeaderInfo {

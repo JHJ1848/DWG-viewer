@@ -1,0 +1,1 @@
+{"name":"CADLight DWG 轻量在线预览器","description":"面向 50~100MB 大型工程总图的 Web 端纯开源 DWG 2D 在线预览工具，基于 LibreDWG WASM、Web Worker 异步解码与硬件加速视口渲染。","requestFramePermissions":[],"majorCapabilities":["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]}

@@ -1,0 +1,102 @@
+[
+  {
+    "file": "simplex.shx",
+    "name": [
+      "simplex",
+      "SIMPLEX",
+      "SIMPLEX8",
+      "txt",
+      "TXT",
+      "monotxt",
+      "MONOTXT8",
+      "complex",
+      "italic",
+      "ITALIC8",
+      "bold",
+      "romans",
+      "ROMANS",
+      "romanc",
+      "romand",
+      "romant",
+      "Standard",
+      "STANDARD",
+      "standard",
+      "default",
+      "arial",
+      "Arial",
+      "times",
+      "Times",
+      "times new roman",
+      "Times New Roman",
+      "roman",
+      "isocp",
+      "isocp2",
+      "isocp3",
+      "isoct",
+      "ISO",
+      "GENISO",
+      "tssdeng",
+      "gbenor",
+      "gbeitc"
+    ],
+    "type": "shx"
+  },
+  {
+    "file": "hztxt.shx",
+    "name": [
+      "hztxt",
+      "HZTXT",
+      "gbhzfs",
+      "tssdchn",
+      "pkpmeng",
+      "intecad",
+      "hzfs",
+      "china",
+      "hz",
+      "simsun",
+      "SimSun",
+      "宋体",
+      "中易宋体",
+      "微软宋体",
+      "simhei",
+      "SimHei",
+      "黑体",
+      "simfang",
+      "FangSong",
+      "FangSong_GB2312",
+      "仿宋",
+      "仿宋_GB2312",
+      "华文仿宋",
+      "msyh",
+      "MSYH",
+      "微软雅黑",
+      "simkai",
+      "楷体"
+    ],
+    "type": "shx",
+    "encoding": "gbk"
+  },
+  {
+    "file": "gbcbig.shx",
+    "name": [
+      "gbcbig",
+      "GBCBIG",
+      "bigfont",
+      "BIGFONT"
+    ],
+    "type": "shx",
+    "encoding": "gbk"
+  },
+  {
+    "file": "amgdt.shx",
+    "name": [
+      "amgdt",
+      "amgdtans",
+      "gdt",
+      "AIGDT",
+      "AMDTSymbols",
+      "ltypeshp"
+    ],
+    "type": "shx"
+  }
+]

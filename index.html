@@ -3,19 +3,200 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <title>CADLight DWG 轻量在线预览器</title>
-    <meta name="description" content="面向 50~100MB 大型工程总图的 Web 端纯开源 DWG 2D 在线预览工具，基于 LibreDWG WASM、Web Worker 异步解码与硬件加速视口渲染。" />
-    <meta property="og:title" content="CADLight DWG 轻量在线预览器" />
-    <meta property="og:description" content="面向 50~100MB 大型工程总图的 Web 端纯开源 DWG 2D 在线预览工具，基于 LibreDWG WASM、Web Worker 异步解码与硬件加速视口渲染。" />
+    <title>DWG-viewer</title>
+    <meta name="description" content="面向大型工程图纸的 Web 与桌面端 DWG 2D 轻量预览工具，支持高性能矢量渲染与图纸缓存加速。" />
+    <meta property="og:title" content="DWG-viewer" />
+    <meta property="og:description" content="面向大型工程图纸的 Web 与桌面端 DWG 2D 轻量预览工具，支持高性能矢量渲染与图纸缓存加速。" />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet" />
+    <link rel="icon" type="image/x-icon" href="./favicon.ico" />
+    <link rel="apple-touch-icon" href="./icons/icon-128x128.png" />
   </head>
-  <body class="bg-[#0B0E17] text-slate-100 antialiased selection:bg-cyan-500/30 selection:text-cyan-200">
+  <body class="bg-[#0F1117] text-slate-100 antialiased selection:bg-slate-700 selection:text-slate-100">
+    <!-- 0 延迟首屏渐进式启动骨架屏 (Web / Desktop / Mobile 三端即刻呈现，首帧无白屏/黑屏感) -->
+    <div id="app-splash" aria-hidden="true">
+      <style>
+        #app-splash {
+          position: fixed;
+          inset: 0;
+          z-index: 99999;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          background-color: #0F1117;
+          color: #f1f5f9;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+          user-select: none;
+          transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        #app-splash.splash-hidden {
+          opacity: 0;
+          pointer-events: none;
+        }
+        .splash-content {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          text-align: center;
+          gap: 20px;
+          max-width: 360px;
+          padding: 0 24px;
+        }
+        .splash-logo-box {
+          position: relative;
+          width: 84px;
+          height: 84px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .splash-logo-glow {
+          position: absolute;
+          inset: -8px;
+          border-radius: 28px;
+          background: radial-gradient(circle, rgba(56, 189, 248, 0.22) 0%, rgba(15, 17, 23, 0) 70%);
+          animation: splash-pulse 2s ease-in-out infinite;
+        }
+        .splash-logo-img {
+          position: relative;
+          width: 100%;
+          height: 100%;
+          object-fit: contain;
+          border-radius: 20px;
+          box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+        }
+        .splash-title-box {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 6px;
+        }
+        .splash-title {
+          font-size: 20px;
+          font-weight: 700;
+          letter-spacing: -0.025em;
+          color: #ffffff;
+          margin: 0;
+        }
+        .splash-subtitle {
+          font-size: 12px;
+          color: #94a3b8;
+          margin: 0;
+        }
+        .splash-progress-container {
+          width: 100%;
+          max-width: 260px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          margin-top: 8px;
+        }
+        .splash-progress-track {
+          width: 100%;
+          height: 4px;
+          background-color: rgba(255, 255, 255, 0.08);
+          border-radius: 9999px;
+          overflow: hidden;
+        }
+        .splash-progress-bar {
+          height: 100%;
+          width: 15%;
+          background: linear-gradient(90deg, #38bdf8, #0ea5e9);
+          border-radius: 9999px;
+          transition: width 0.25s ease-out;
+        }
+        .splash-status-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          font-size: 11px;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+          color: #64748b;
+        }
+        .splash-status-text {
+          color: #94a3b8;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        @keyframes splash-pulse {
+          0%, 100% { opacity: 0.4; transform: scale(0.98); }
+          50% { opacity: 0.9; transform: scale(1.03); }
+        }
+      </style>
+      <div class="splash-content">
+        <div class="splash-logo-box">
+          <div class="splash-logo-glow"></div>
+          <img class="splash-logo-img" src="./logo.png" onerror="this.onerror=null;this.src='./icons/icon-128x128.png';" alt="DWG-viewer Logo" />
+        </div>
+        <div class="splash-title-box">
+          <h1 class="splash-title">DWG-viewer</h1>
+          <p class="splash-subtitle">工程级 DWG 2D 轻量化预览工具</p>
+        </div>
+        <div class="splash-progress-container">
+          <div class="splash-progress-track">
+            <div id="splash-bar" class="splash-progress-bar"></div>
+          </div>
+          <div class="splash-status-row">
+            <span id="splash-status" class="splash-status-text">正在启动服务与运行时...</span>
+            <span id="splash-pct">15%</span>
+          </div>
+        </div>
+      </div>
+      <script>
+        (function() {
+          var bar = document.getElementById('splash-bar');
+          var text = document.getElementById('splash-status');
+          var pct = document.getElementById('splash-pct');
+          var p = 15;
+          var stages = [
+            { threshold: 35, msg: '正在初始化矢量视口管线...' },
+            { threshold: 65, msg: '正在就绪 LibreDWG WASM 核心...' },
+            { threshold: 85, msg: '正在挂载工程图纸工作台...' }
+          ];
+          var timer = setInterval(function() {
+            if (p < 88) {
+              p += Math.floor(Math.random() * 6) + 4;
+              if (p > 88) p = 88;
+              if (bar) bar.style.width = p + '%';
+              if (pct) pct.textContent = p + '%';
+              for (var i = stages.length - 1; i >= 0; i--) {
+                if (p >= stages[i].threshold && text) {
+                  text.textContent = stages[i].msg;
+                  break;
+                }
+              }
+            }
+          }, 100);
+
+          // [03_ui_design] 兜底超时安全机制：2.5 秒后若未收到 React 就绪信号，强制平滑消隐，绝不永久卡死在 88%
+          var fallbackTimeout = setTimeout(function() {
+            if (window.__finishSplash) {
+              window.__finishSplash();
+            }
+          }, 2500);
+
+          window.__finishSplash = function() {
+            clearTimeout(fallbackTimeout);
+            clearInterval(timer);
+            if (bar) bar.style.width = '100%';
+            if (pct) pct.textContent = '100%';
+            if (text) text.textContent = '就绪';
+            setTimeout(function() {
+              var splash = document.getElementById('app-splash');
+              if (splash) {
+                splash.classList.add('splash-hidden');
+                setTimeout(function() {
+                  if (splash && splash.parentNode) splash.parentNode.removeChild(splash);
+                }, 380);
+              }
+            }, 80);
+          };
+        })();
+      </script>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

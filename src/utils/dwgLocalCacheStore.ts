@@ -4,8 +4,10 @@ import {
   DwgParseResultPayload,
   compressEnvelopeToGzip,
   decompressGzipToEnvelope,
+  normalizeDwgFileNameForConverter,
   summarizeDwgModel,
 } from './dwgGzipCache';
+import { DeviceMemoryProfile, getDeviceMemoryProfile } from './deviceProfile';
 
 const DB_NAME = 'cadlight_dwg_gzip_cache_v3';
 const DB_VERSION = 1;
@@ -42,6 +44,14 @@ export interface DecompressedCacheHit {
   decompressMs: number;
   gzBytes: Uint8Array;
   hitLayer: 'local-idb' | 'server-shared';
+}
+
+export function isMobileOrRestricted(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return (
+    /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
 }
 
 const memoryStore = new Map<string, LocalGzipCacheRecord>();
@@ -142,7 +152,21 @@ async function fetchRecordFromServerCache(
 }
 
 async function persistRecordToIdb(record: LocalGzipCacheRecord): Promise<void> {
-  memoryStore.set(record.fingerprint, record);
+  const isRestricted = isMobileOrRestricted();
+  const gzLen = record.gzBytes?.byteLength ?? 0;
+
+  // 🛡️ iOS / Mobile Jetsam Protection:
+  // 1. Never store binary gzBytes in JS heap memoryStore on mobile devices.
+  // 2. For heavy drawings (>10MB compressed Gzip) on mobile, skip local IndexedDB persistence
+  //    to prevent WebKit's Structured Clone cross-process IPC from duplicating 40MB+ buffers
+  //    (large drawings stream directly from the L2 server shared cache).
+  if (!isRestricted && gzLen <= 10 * 1024 * 1024) {
+    memoryStore.set(record.fingerprint, record);
+  }
+  if (isRestricted && gzLen > 10 * 1024 * 1024) {
+    return;
+  }
+
   const db = await openGzipCacheDb();
   if (db) {
     await new Promise<void>((resolve) => {
@@ -266,8 +290,12 @@ export async function saveImportedGzipCache(
  * Decompresses it via DecompressionStream('gzip') and returns the ready-to-render DwgParseResultPayload.
  */
 export async function getAndDecompressGzipCache(
-  fingerprint: string
+  fingerprint: string,
+  onProgress?: (percent: number, detail: string) => void,
+  profile?: DeviceMemoryProfile
 ): Promise<DecompressedCacheHit | null> {
+  const activeProfile = profile ?? getDeviceMemoryProfile();
+  const isRestricted = isMobileOrRestricted() || activeProfile.defenseModeEnabled;
   let hitLayer: 'local-idb' | 'server-shared' = 'local-idb';
   let record: LocalGzipCacheRecord | undefined = memoryStore.get(fingerprint);
 
@@ -284,14 +312,90 @@ export async function getAndDecompressGzipCache(
           resolve(undefined);
         }
       });
-      if (record && record.gzBytes) {
+      if (
+        record &&
+        record.gzBytes &&
+        !isRestricted &&
+        record.gzBytes.byteLength <= 10 * 1024 * 1024
+      ) {
         memoryStore.set(fingerprint, record);
       }
     }
   }
 
   // L2 Fallback: Query local server shared disk cache (enables cross-device & cross-browser sharing)
-  if (!record || !record.gzBytes) {
+  if (!record || !record.gzBytes || record.gzBytes.byteLength === 0) {
+    // 🛡️ Zero-Copy Network Stream Decompression on iOS / Mobile / Defense Mode:
+    // Pipe `res.body` (ReadableStream<Uint8Array>) directly into `decompressGzipToEnvelope`
+    // without allocating a contiguous 41MB ArrayBuffer via `res.arrayBuffer()` or cloning into IndexedDB!
+    if (isRestricted && typeof fetch !== 'undefined') {
+      try {
+        const res = await fetch(`${SERVER_CACHE_API}/${encodeURIComponent(fingerprint)}`, {
+          method: 'GET',
+          headers: { Accept: 'application/gzip' },
+        });
+        if (res.ok && res.status !== 204 && res.body) {
+          let serverMeta: Partial<LocalGzipCacheMeta> = {};
+          const metaHeader = res.headers.get('X-Dwg-Cache-Meta');
+          if (metaHeader) {
+            try {
+              serverMeta = JSON.parse(decodeURIComponent(metaHeader));
+            } catch {
+              // ignore
+            }
+          }
+          const contentLength =
+            Number(res.headers.get('content-length')) ||
+            Number(serverMeta.compressedBytes) ||
+            0;
+          const t0 = performance.now();
+          const envelope = await decompressGzipToEnvelope(res.body, onProgress, activeProfile);
+          const decompressMs = Math.max(1, Math.round(performance.now() - t0));
+          const now = Date.now();
+          const rawJsonBytes =
+            envelope.__rawJsonBytes ||
+            Number(serverMeta.rawJsonBytes) ||
+            contentLength * 5;
+          const compressedBytes = Number(serverMeta.compressedBytes) || contentLength;
+          const meta: LocalGzipCacheMeta = {
+            fingerprint: serverMeta.fingerprint || envelope.fingerprint || fingerprint,
+            fileName: serverMeta.fileName || envelope.fileName || `${fingerprint}.dwg`,
+            originalByteLength:
+              Number(serverMeta.originalByteLength) ||
+              envelope.originalByteLength ||
+              compressedBytes,
+            rawJsonBytes,
+            compressedBytes,
+            compressionRatio:
+              Number(serverMeta.compressionRatio) ||
+              (rawJsonBytes > compressedBytes && rawJsonBytes > 0
+                ? +(1 - compressedBytes / rawJsonBytes).toFixed(4)
+                : 0),
+            versionLabel:
+              serverMeta.versionLabel || envelope.versionLabel || 'AutoCAD DWG',
+            entityCount:
+              Number(serverMeta.entityCount) || envelope.entityCount || 0,
+            layerCount:
+              Number(serverMeta.layerCount) || envelope.layerCount || 0,
+            wasmParseMs:
+              Number(serverMeta.wasmParseMs) || envelope.wasmParseMs || 0,
+            createdAt: Number(serverMeta.createdAt) || envelope.createdAt || now,
+            updatedAt: now,
+            storageScope: 'server-shared',
+          };
+          return {
+            meta,
+            payload: envelope.payload,
+            decompressMs,
+            gzBytes: new Uint8Array(0),
+            hitLayer: 'server-shared',
+          };
+        }
+      } catch (err) {
+        console.warn('[GzipCache] Direct L2 stream decompression failed, falling back:', err);
+      }
+    }
+
     const serverRecord = await fetchRecordFromServerCache(fingerprint);
     if (serverRecord && serverRecord.gzBytes) {
       record = serverRecord;
@@ -306,18 +410,23 @@ export async function getAndDecompressGzipCache(
 
   const t0 = performance.now();
   try {
-    const envelope = await decompressGzipToEnvelope(record.gzBytes);
+    const envelope = await decompressGzipToEnvelope(record.gzBytes, onProgress, activeProfile);
     const decompressMs = Math.max(1, Math.round(performance.now() - t0));
 
     record.updatedAt = Date.now();
-    void touchRecordTimestamp(record);
+    if (!isRestricted && record.gzBytes.byteLength <= 10 * 1024 * 1024) {
+      void touchRecordTimestamp(record);
+    }
 
     const { gzBytes, ...meta } = record;
+    if (isRestricted) {
+      (record as any).gzBytes = null;
+    }
     return {
       meta,
       payload: envelope.payload,
       decompressMs,
-      gzBytes,
+      gzBytes: isRestricted ? new Uint8Array(0) : gzBytes,
       hitLayer,
     };
   } catch (err) {
@@ -345,7 +454,9 @@ export async function getRawGzipCacheRecord(
         req.onsuccess = () => {
           const res = req.result as LocalGzipCacheRecord | undefined;
           if (res && res.gzBytes) {
-            memoryStore.set(fingerprint, res);
+            if (!isMobileOrRestricted() && res.gzBytes.byteLength <= 10 * 1024 * 1024) {
+              memoryStore.set(fingerprint, res);
+            }
             resolve(res);
           } else {
             resolve(null);
@@ -370,6 +481,8 @@ export async function getRawGzipCacheRecord(
 /**
  * Lists metadata for all cached Gzip drawings across L1 (Browser IndexedDB) and L2 (Server Disk Cache),
  * sorted by most recently accessed.
+ * Uses an IndexedDB cursor (`openCursor`) and immediately releases `gzBytes` per record so multiple
+ * large binary blobs never coexist in memory on mobile devices.
  */
 export async function listGzipCacheEntries(): Promise<LocalGzipCacheMeta[]> {
   const localMap = new Map<string, LocalGzipCacheMeta>();
@@ -381,23 +494,46 @@ export async function listGzipCacheEntries(): Promise<LocalGzipCacheMeta[]> {
 
   const db = await openGzipCacheDb();
   if (db) {
-    const dbRecords = await new Promise<LocalGzipCacheRecord[]>((resolve) => {
+    await new Promise<void>((resolve) => {
       try {
         const tx = db.transaction(STORE_NAME, 'readonly');
-        const req = tx.objectStore(STORE_NAME).getAll();
-        req.onsuccess = () => resolve((req.result as LocalGzipCacheRecord[]) || []);
-        req.onerror = () => resolve([]);
+        const store = tx.objectStore(STORE_NAME);
+        if (typeof store.openCursor === 'function') {
+          const req = store.openCursor();
+          req.onsuccess = () => {
+            const cursor = req.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const rec = cursor.value as LocalGzipCacheRecord | undefined;
+            if (rec && rec.fingerprint) {
+              (rec as any).gzBytes = null;
+              const { gzBytes: _gz, ...meta } = rec;
+              localMap.set(rec.fingerprint, { ...meta, storageScope: 'local-only' });
+            }
+            cursor.continue();
+          };
+          req.onerror = () => resolve();
+        } else {
+          const req = store.getAll();
+          req.onsuccess = () => {
+            const dbRecords = (req.result as LocalGzipCacheRecord[]) || [];
+            for (const rec of dbRecords) {
+              if (rec && rec.fingerprint) {
+                (rec as any).gzBytes = null;
+                const { gzBytes: _gz, ...meta } = rec;
+                localMap.set(rec.fingerprint, { ...meta, storageScope: 'local-only' });
+              }
+            }
+            resolve();
+          };
+          req.onerror = () => resolve();
+        }
       } catch {
-        resolve([]);
+        resolve();
       }
     });
-
-    for (const rec of dbRecords) {
-      if (rec && rec.fingerprint) {
-        const { gzBytes: _gz, ...meta } = rec;
-        localMap.set(rec.fingerprint, { ...meta, storageScope: 'local-only' });
-      }
-    }
   }
 
   // Merge with L2 Server Shared Cache entries
@@ -432,6 +568,60 @@ export async function listGzipCacheEntries(): Promise<LocalGzipCacheMeta[]> {
   }
 
   return Array.from(localMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * Finds a cached Gzip entry by its DWG file name (case-insensitive, normalized).
+ * Implements the "同名匹配法则" (same-name matching rule) to prefer Gzip cache
+ * over cold WASM re-parsing when selecting drawings by name or URL.
+ * Prioritizes in-memory metadata and the lightweight server metadata endpoint (`GET /api/dwg-cache`)
+ * before scanning local IndexedDB records.
+ */
+export async function findGzipCacheByFileName(
+  fileName: string
+): Promise<LocalGzipCacheMeta | null> {
+  const cleanTarget = normalizeDwgFileNameForConverter(fileName).toLowerCase();
+
+  // 1. Check in-memory cache first (0 I/O overhead)
+  for (const [, rec] of memoryStore.entries()) {
+    if (normalizeDwgFileNameForConverter(rec.fileName).toLowerCase() === cleanTarget) {
+      const { gzBytes: _gz, ...meta } = rec;
+      return { ...meta, storageScope: meta.storageScope || 'local-only' };
+    }
+  }
+
+  // 2. Query lightweight L2 Server metadata JSON list (avoids deserializing local IndexedDB binary blobs)
+  if (typeof fetch !== 'undefined') {
+    try {
+      const res = await fetch(SERVER_CACHE_API, { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        const serverEntries: LocalGzipCacheMeta[] = Array.isArray(data?.entries)
+          ? data.entries
+          : [];
+        for (const srvMeta of serverEntries) {
+          if (
+            srvMeta &&
+            srvMeta.fingerprint &&
+            normalizeDwgFileNameForConverter(srvMeta.fileName).toLowerCase() === cleanTarget
+          ) {
+            return { ...srvMeta, storageScope: 'server-shared' };
+          }
+        }
+      }
+    } catch {
+      // Fallback to full list scan
+    }
+  }
+
+  // 3. Fallback to full L1 + L2 metadata scan
+  const allEntries = await listGzipCacheEntries();
+  for (const entry of allEntries) {
+    if (normalizeDwgFileNameForConverter(entry.fileName).toLowerCase() === cleanTarget) {
+      return entry;
+    }
+  }
+  return null;
 }
 
 /**
@@ -504,21 +694,50 @@ async function touchRecordTimestamp(record: LocalGzipCacheRecord): Promise<void>
 }
 
 async function enforceLruLimit(db: IDBDatabase): Promise<void> {
-  const all = await new Promise<LocalGzipCacheRecord[]>((resolve) => {
+  const allMeta = await new Promise<Array<{ fingerprint: string; updatedAt: number }>>((resolve) => {
+    const items: Array<{ fingerprint: string; updatedAt: number }> = [];
     try {
       const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).getAll();
-      req.onsuccess = () => resolve((req.result as LocalGzipCacheRecord[]) || []);
-      req.onerror = () => resolve([]);
+      const store = tx.objectStore(STORE_NAME);
+      if (typeof store.openCursor === 'function') {
+        const req = store.openCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) {
+            resolve(items);
+            return;
+          }
+          const rec = cursor.value as LocalGzipCacheRecord | undefined;
+          if (rec && rec.fingerprint) {
+            (rec as any).gzBytes = null;
+            items.push({ fingerprint: rec.fingerprint, updatedAt: rec.updatedAt || 0 });
+          }
+          cursor.continue();
+        };
+        req.onerror = () => resolve(items);
+      } else {
+        const req = store.getAll();
+        req.onsuccess = () => {
+          const list = (req.result as LocalGzipCacheRecord[]) || [];
+          for (const rec of list) {
+            if (rec && rec.fingerprint) {
+              (rec as any).gzBytes = null;
+              items.push({ fingerprint: rec.fingerprint, updatedAt: rec.updatedAt || 0 });
+            }
+          }
+          resolve(items);
+        };
+        req.onerror = () => resolve([]);
+      }
     } catch {
       resolve([]);
     }
   });
 
-  if (all.length <= MAX_CACHE_ENTRIES) return;
+  if (allMeta.length <= MAX_CACHE_ENTRIES) return;
 
-  all.sort((a, b) => b.updatedAt - a.updatedAt);
-  const toEvict = all.slice(MAX_CACHE_ENTRIES);
+  allMeta.sort((a, b) => b.updatedAt - a.updatedAt);
+  const toEvict = allMeta.slice(MAX_CACHE_ENTRIES);
 
   await new Promise<void>((resolve) => {
     try {

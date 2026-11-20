@@ -1,3 +1,4 @@
+import parserWorkerUrl from '../workers/libredwgParserWorker.ts?worker&url';
 import {
   AcApDocManager,
   AcApSettingManager,
@@ -37,6 +38,7 @@ import {
 import {
   clearAllGzipCacheEntries,
   deleteGzipCacheEntry,
+  findGzipCacheByFileName,
   getAndDecompressGzipCache,
   getRawGzipCacheRecord,
   listGzipCacheEntries,
@@ -44,6 +46,21 @@ import {
   saveDwgGzipCache,
   saveImportedGzipCache,
 } from '../utils/dwgLocalCacheStore';
+import {
+  calculateAdaptiveChunkSize,
+  getDeviceMemoryProfile,
+  DeviceMemoryProfile,
+} from '../utils/deviceProfile';
+
+export type DwgPipelineMode = 'detecting' | 'gzip_cache' | 'dwg_full_parse';
+
+/**
+ * [09_viewport_interaction] 视口交互模式枚举（对齐 @mlightcad/cad-simple-viewer 底层 AcEdViewMode）
+ */
+export enum AcEdViewMode {
+  SELECTION = 0,
+  PAN = 1,
+}
 
 export type DwgStageId =
   | 'FETCH_OR_READ'
@@ -70,6 +87,7 @@ export interface DwgProgressState {
   elapsedMs: number;
   elapsedSeconds: string;
   fileSizeLabel?: string;
+  pipelineMode: DwgPipelineMode;
   nodes: DwgProgressNode[];
 }
 
@@ -112,21 +130,39 @@ export interface DwgViewerCallbacks {
 export interface LoadFromUrlOptions {
   /** Optional custom file name when URL does not end in .dwg */
   fileName?: string;
-  /** Sa-Token credential string for MinIO Spring proxy */
-  satoken?: string;
-  /** Optional HTTP headers (e.g., satoken or Authorization Bearer token for Spring Boot / MinIO proxy) */
+  /** Optional custom HTTP headers */
   headers?: Record<string, string>;
   /** Force bypass local Gzip cache and re-run WASM decoding */
   bypassCache?: boolean;
 }
 
-const DEFAULT_NODES: DwgProgressNode[] = [
+export const DETECTING_NODES: DwgProgressNode[] = [
   { id: 'FETCH_OR_READ', step: 1, title: '文件读取与校验', status: 'pending' },
-  { id: 'WASM_DECODE', step: 2, title: 'WASM解码 / Gzip缓存', status: 'pending' },
-  { id: 'ENTITY_CONVERSION', step: 3, title: 'CAD 图元模型构建', status: 'pending' },
-  { id: 'FONT_LAYOUT', step: 4, title: '矢量字体与排版', status: 'pending' },
-  { id: 'WEBGL_RENDER', step: 5, title: 'WebGL 视口呈现', status: 'pending' },
+  { id: 'WASM_DECODE', step: 2, title: '图纸解码', status: 'pending' },
+  { id: 'ENTITY_CONVERSION', step: 3, title: '图元模型构建', status: 'pending' },
+  { id: 'FONT_LAYOUT', step: 4, title: '文字排版与样式', status: 'pending' },
+  { id: 'WEBGL_RENDER', step: 5, title: '视口渲染呈现', status: 'pending' },
 ];
+
+export const GZIP_CACHE_NODES: DwgProgressNode[] = [
+  { id: 'FETCH_OR_READ', step: 1, title: '文件读取与校验', status: 'pending' },
+  { id: 'WASM_DECODE', step: 2, title: '缓存流式解压', status: 'pending' },
+  { id: 'ENTITY_CONVERSION', step: 3, title: '图元模型构建', status: 'pending' },
+  { id: 'FONT_LAYOUT', step: 4, title: '文字排版与样式', status: 'pending' },
+  { id: 'WEBGL_RENDER', step: 5, title: '视口渲染呈现', status: 'pending' },
+];
+
+export const DWG_FULL_PARSE_NODES: DwgProgressNode[] = [
+  { id: 'FETCH_OR_READ', step: 1, title: '文件读取与校验', status: 'pending' },
+  { id: 'WASM_DECODE', step: 2, title: '图纸核心解码', status: 'pending' },
+  { id: 'ENTITY_CONVERSION', step: 3, title: '图元模型构建', status: 'pending' },
+  { id: 'FONT_LAYOUT', step: 4, title: '文字排版与样式', status: 'pending' },
+  { id: 'WEBGL_RENDER', step: 5, title: '视口渲染呈现', status: 'pending' },
+];
+
+export const DEFAULT_NODES: DwgProgressNode[] = DETECTING_NODES;
+
+export { calculateAdaptiveChunkSize } from '../utils/deviceProfile';
 
 interface PendingParseContext {
   fileName: string;
@@ -137,6 +173,7 @@ interface PendingParseContext {
 interface ConverterHooks {
   onStageUpdate: (stageId: DwgStageId, minPercent: number, detail: string) => void;
   onCacheResolved: (info: Omit<DwgCacheStatusInfo, 'totalElapsedMs'>) => void;
+  getProfile?: () => DeviceMemoryProfile;
 }
 
 /**
@@ -149,10 +186,16 @@ class CachedLibreDwgConverter extends AcDbLibreDwgConverter {
   private stubPayloads = new Map<string, DwgParseResultPayload<DwgDatabase>>();
   private pendingContext: PendingParseContext | null = null;
   private hooks: ConverterHooks;
+  private tracker: ProgressTracker;
 
-  constructor(config: AcDbDatabaseConverterConfig, hooks: ConverterHooks) {
+  constructor(
+    config: AcDbDatabaseConverterConfig,
+    hooks: ConverterHooks,
+    tracker: ProgressTracker
+  ) {
     super(config);
     this.hooks = hooks;
+    this.tracker = tracker;
   }
 
   public setPendingContext(ctx: PendingParseContext | null): void {
@@ -176,10 +219,11 @@ class CachedLibreDwgConverter extends AcDbLibreDwgConverter {
       const injected = this.stubPayloads.get(stubToken);
       if (injected) {
         this.stubPayloads.delete(stubToken);
+        this.tracker.setPipelineMode('gzip_cache');
         this.hooks.onStageUpdate(
           'WASM_DECODE',
           52,
-          '⚡ 已从 Gzip 压缩缓存直接注入 DwgDatabase 模型，0ms 跳过 WASM 解码...'
+          '已从图纸缓存载入模型数据...'
         );
         return injected as AcDbParsingTaskResult<DwgDatabase>;
       }
@@ -195,14 +239,22 @@ class CachedLibreDwgConverter extends AcDbLibreDwgConverter {
 
     // 2. Query L1 (IndexedDB) + L2 (Server Shared Disk) Gzip Cache (unless user requested forced re-parse)
     if (!bypassCache) {
-      const hit = await getAndDecompressGzipCache(fingerprint);
+      const currentProfile = this.hooks.getProfile?.();
+      const hit = await getAndDecompressGzipCache(
+        fingerprint,
+        (pct, detail) => {
+          this.hooks.onStageUpdate('WASM_DECODE', pct, detail);
+        },
+        currentProfile
+      );
       if (hit && hit.payload && hit.payload.model) {
         const ratioPct = Math.round(hit.meta.compressionRatio * 100);
         const isServerHit = hit.hitLayer === 'server-shared';
+        this.tracker.setPipelineMode('gzip_cache');
         this.hooks.onStageUpdate(
           'WASM_DECODE',
           54,
-          `⚡ 命中${isServerHit ? '服务端共享' : '本机浏览器'} Gzip 缓存 (${formatByteSize(hit.meta.compressedBytes)}, 压缩率 ${ratioPct}%)，流式解压耗时 ${hit.decompressMs}ms，已跳过 WASM 解码！`
+          `已命中${isServerHit ? '服务端共享' : '本地'}缓存 (${formatByteSize(hit.meta.compressedBytes)})，解压耗时 ${hit.decompressMs}ms`
         );
         this.hooks.onCacheResolved({
           source: isServerHit ? 'server-gzip-shared' : 'local-gzip-idb',
@@ -222,48 +274,65 @@ class CachedLibreDwgConverter extends AcDbLibreDwgConverter {
     }
 
     // 3. Cache miss -> Execute LibreDWG WebAssembly Worker decode
+    this.tracker.setPipelineMode('dwg_full_parse');
     this.hooks.onStageUpdate(
       'WASM_DECODE',
       22,
-      `未命中本地缓存，正在执行 LibreDWG WASM 二进制解码 (${formatByteSize(inputByteLength)})...`
+      `正在解析图纸二进制结构 (${formatByteSize(inputByteLength)})...`
     );
     const parseStart = performance.now();
     const parsedResult = await super.parse(data, timeout);
     const wasmParseMs = Math.max(1, Math.round(performance.now() - parseStart));
 
-    // 4. Compress intermediate result to Gzip (.dwg.cache.gz) and persist in IndexedDB
+    // 4. Asynchronous decoupled Gzip cache persistence:
+    // =========================================================================
+    // CRITICAL PERFORMANCE SAFEGUARD - NEVER AWAIT GZIP COMPRESSION IN RENDERING PATH:
+    //
+    // For large drawings (50MB+ DWG, ~200MB JSON), Gzip serialization and compression
+    // takes 1.5~3 seconds of intensive CPU work.
+    // If we await saveDwgGzipCache() here synchronously, the user is forced to wait for
+    // Gzip compression before entity conversion and WebGL rendering can even start!
+    //
+    // Instead, we immediately return parsedResult to hand over the CAD database model
+    // to openDocument() for immediate rendering, and dispatch saveDwgGzipCache() to run
+    // in the background via setTimeout(..., 50) without blocking the rendering pipeline.
+    // =========================================================================
     this.hooks.onStageUpdate(
-      'WASM_DECODE',
-      50,
-      `WASM 解码完成 (${(wasmParseMs / 1000).toFixed(1)}s)，正在通过 CompressionStream('gzip') 压缩并保存本地缓存...`
+      'ENTITY_CONVERSION',
+      52,
+      `图纸解码完成 (${(wasmParseMs / 1000).toFixed(1)}s)，正在构建渲染模型...`
     );
 
-    try {
-      const record = await saveDwgGzipCache({
-        fingerprint,
-        fileName,
-        originalByteLength: inputByteLength,
-        versionLabel,
-        wasmParseMs,
-        payload: parsedResult as DwgParseResultPayload,
-      });
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const record = await saveDwgGzipCache({
+            fingerprint,
+            fileName,
+            originalByteLength: inputByteLength,
+            versionLabel,
+            wasmParseMs,
+            payload: parsedResult as DwgParseResultPayload,
+          });
 
-      this.hooks.onCacheResolved({
-        source: 'wasm-cold',
-        fingerprint: record.fingerprint,
-        fileName: record.fileName,
-        originalByteLength: record.originalByteLength,
-        rawJsonBytes: record.rawJsonBytes,
-        compressedBytes: record.compressedBytes,
-        compressionRatio: record.compressionRatio,
-        wasmParseMs,
-        decompressMs: 0,
-        entityCount: record.entityCount,
-        layerCount: record.layerCount,
-      });
-    } catch (err) {
-      console.warn('[CachedLibreDwgConverter] Failed to save Gzip cache:', err);
-    }
+          this.hooks.onCacheResolved({
+            source: 'wasm-cold',
+            fingerprint: record.fingerprint,
+            fileName: record.fileName,
+            originalByteLength: record.originalByteLength,
+            rawJsonBytes: record.rawJsonBytes,
+            compressedBytes: record.compressedBytes,
+            compressionRatio: record.compressionRatio,
+            wasmParseMs,
+            decompressMs: 0,
+            entityCount: record.entityCount,
+            layerCount: record.layerCount,
+          });
+        } catch (err) {
+          console.warn('[CachedLibreDwgConverter] Background Gzip cache persistence failed:', err);
+        }
+      })();
+    }, 50);
 
     return parsedResult;
   }
@@ -274,6 +343,7 @@ class CachedLibreDwgConverter extends AcDbLibreDwgConverter {
  */
 class ProgressTracker {
   private currentStage: DwgStageId = 'FETCH_OR_READ';
+  private pipelineMode: DwgPipelineMode = 'detecting';
   private targetPercent = 5;
   private currentPercent = 0;
   private timer: any = null;
@@ -286,31 +356,45 @@ class ProgressTracker {
     this.onUpdate = onUpdate;
   }
 
-  public start(fileSizeLabel = '') {
+  public setPipelineMode(mode: DwgPipelineMode): void {
+    if (!this.timer) return;
+    this.pipelineMode = mode;
+    this.emit(true, this.lastCustomDetail);
+  }
+
+  public getPipelineMode(): DwgPipelineMode {
+    return this.pipelineMode;
+  }
+
+  public start(fileSizeLabel = '', mode: DwgPipelineMode = 'detecting'): void {
     this.stop();
     this.startTime = Date.now();
     this.fileSizeLabel = fileSizeLabel;
+    this.pipelineMode = mode;
     this.currentPercent = 3;
     this.lastCustomDetail = '';
-    this.setStage('FETCH_OR_READ', 5, '正在读取二进制字节流...');
+    this.targetPercent = 5;
 
     this.timer = setInterval(() => {
       this.tick();
     }, 100);
+    this.setStage('FETCH_OR_READ', 5, '正在读取二进制字节流...');
   }
 
   public getElapsedMs(): number {
     return this.startTime ? Math.max(1, Date.now() - this.startTime) : 0;
   }
 
-  public setStage(stageId: DwgStageId, minPercent: number, detail: string) {
+  public setStage(stageId: DwgStageId, minPercent: number, detail: string): void {
+    if (!this.timer) return;
     this.currentStage = stageId;
     this.targetPercent = Math.max(this.targetPercent, minPercent);
     this.lastCustomDetail = detail;
     this.tick(detail);
   }
 
-  public advanceTarget(targetPct: number, detail?: string) {
+  public advanceTarget(targetPct: number, detail?: string): void {
+    if (!this.timer) return;
     this.targetPercent = Math.max(this.targetPercent, Math.min(99, targetPct));
     if (detail) {
       this.lastCustomDetail = detail;
@@ -318,7 +402,7 @@ class ProgressTracker {
     }
   }
 
-  public finish() {
+  public finish(): void {
     this.currentPercent = 100;
     this.targetPercent = 100;
     this.setStage('WEBGL_RENDER', 100, '图纸解析渲染完成');
@@ -326,19 +410,19 @@ class ProgressTracker {
     this.stop();
   }
 
-  public error() {
+  public error(): void {
     this.stop();
     this.emit(false);
   }
 
-  public stop() {
+  public stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
   }
 
-  private tick(customDetail?: string) {
+  private tick(customDetail?: string): void {
     if (this.currentPercent < this.targetPercent) {
       const step = Math.max(0.4, (this.targetPercent - this.currentPercent) * 0.18);
       this.currentPercent = Math.min(
@@ -354,7 +438,7 @@ class ProgressTracker {
     this.emit(true, customDetail || this.lastCustomDetail);
   }
 
-  private emit(isLoading: boolean, customDetail?: string) {
+  private emit(isLoading: boolean, customDetail?: string): void {
     const elapsedMs = this.startTime ? Date.now() - this.startTime : 0;
     const elapsedSeconds = `${(elapsedMs / 1000).toFixed(1)}s`;
 
@@ -362,37 +446,106 @@ class ProgressTracker {
     let stageTitle = '文件读取与校验';
     let defaultDetail = '正在读取文件字节流...';
 
-    switch (this.currentStage) {
-      case 'FETCH_OR_READ':
-        stepNum = 1;
-        stageTitle = '文件读取与校验';
-        defaultDetail = `正在加载文件${this.fileSizeLabel ? ` (${this.fileSizeLabel})` : ''}并校验头部签名...`;
-        break;
-      case 'WASM_DECODE':
-        stepNum = 2;
-        stageTitle = 'WASM解码 / Gzip缓存';
-        defaultDetail = `正在检索本地 Gzip 缓存或执行 LibreDWG WASM 二进制解码...`;
-        break;
-      case 'ENTITY_CONVERSION':
-        stepNum = 3;
-        stageTitle = 'CAD 图元模型构建';
-        defaultDetail = `正在批量构建图元实体树、块表记录与图层数据 (Batch Chunk=5000)...`;
-        break;
-      case 'FONT_LAYOUT':
-        stepNum = 4;
-        stageTitle = '矢量字体与排版';
-        defaultDetail = `正在匹配加载 CAD SHX 矢量字库并排版 MText 文字网格...`;
-        break;
-      case 'WEBGL_RENDER':
-        stepNum = 5;
-        stageTitle = 'WebGL 视口呈现';
-        defaultDetail = isLoading
-          ? `正在计算智能聚簇居中并初始化 2D 正交视口...`
-          : `图纸已就绪`;
-        break;
+    if (this.pipelineMode === 'gzip_cache') {
+      switch (this.currentStage) {
+        case 'FETCH_OR_READ':
+          stepNum = 1;
+          stageTitle = '文件读取与校验';
+          defaultDetail = `正在加载文件${this.fileSizeLabel ? ` (${this.fileSizeLabel})` : ''}...`;
+          break;
+        case 'WASM_DECODE':
+          stepNum = 2;
+          stageTitle = '缓存流式解压';
+          defaultDetail = '正在解压图纸缓存数据...';
+          break;
+        case 'ENTITY_CONVERSION':
+          stepNum = 3;
+          stageTitle = '图元模型构建';
+          defaultDetail = '正在加载图元实体与图层结构...';
+          break;
+        case 'FONT_LAYOUT':
+          stepNum = 4;
+          stageTitle = '文字排版与样式';
+          defaultDetail = '正在加载矢量字库与文本排版...';
+          break;
+        case 'WEBGL_RENDER':
+          stepNum = 5;
+          stageTitle = '视口渲染呈现';
+          defaultDetail = isLoading
+            ? '正在计算视图范围并初始化视口...'
+            : '图纸加载完成';
+          break;
+      }
+    } else if (this.pipelineMode === 'dwg_full_parse') {
+      switch (this.currentStage) {
+        case 'FETCH_OR_READ':
+          stepNum = 1;
+          stageTitle = '文件读取与校验';
+          defaultDetail = `正在加载 DWG 文件${this.fileSizeLabel ? ` (${this.fileSizeLabel})` : ''}并校验格式...`;
+          break;
+        case 'WASM_DECODE':
+          stepNum = 2;
+          stageTitle = '图纸核心解码';
+          defaultDetail = '正在解析 DWG 二进制数据...';
+          break;
+        case 'ENTITY_CONVERSION':
+          stepNum = 3;
+          stageTitle = '图元模型构建';
+          defaultDetail = '正在提取图元数据并构建模型树与图层索引...';
+          break;
+        case 'FONT_LAYOUT':
+          stepNum = 4;
+          stageTitle = '文字排版与样式';
+          defaultDetail = '正在加载矢量字库与文本排版...';
+          break;
+        case 'WEBGL_RENDER':
+          stepNum = 5;
+          stageTitle = '视口渲染呈现';
+          defaultDetail = isLoading
+            ? '正在初始化视口并生成加速缓存...'
+            : '图纸解析完成';
+          break;
+      }
+    } else {
+      switch (this.currentStage) {
+        case 'FETCH_OR_READ':
+          stepNum = 1;
+          stageTitle = '文件读取与校验';
+          defaultDetail = `正在加载文件${this.fileSizeLabel ? ` (${this.fileSizeLabel})` : ''}并校验格式...`;
+          break;
+        case 'WASM_DECODE':
+          stepNum = 2;
+          stageTitle = '图纸解码';
+          defaultDetail = '正在检查缓存并准备图纸解码...';
+          break;
+        case 'ENTITY_CONVERSION':
+          stepNum = 3;
+          stageTitle = '图元模型构建';
+          defaultDetail = '正在构建图元实体树、块表与图层数据...';
+          break;
+        case 'FONT_LAYOUT':
+          stepNum = 4;
+          stageTitle = '文字排版与样式';
+          defaultDetail = '正在加载矢量字库与文本排版...';
+          break;
+        case 'WEBGL_RENDER':
+          stepNum = 5;
+          stageTitle = '视口渲染呈现';
+          defaultDetail = isLoading
+            ? '正在计算视图范围并初始化视口...'
+            : '图纸已就绪';
+          break;
+      }
     }
 
-    const nodes: DwgProgressNode[] = DEFAULT_NODES.map((node) => {
+    const templateNodes =
+      this.pipelineMode === 'gzip_cache'
+        ? GZIP_CACHE_NODES
+        : this.pipelineMode === 'dwg_full_parse'
+        ? DWG_FULL_PARSE_NODES
+        : DETECTING_NODES;
+
+    const nodes: DwgProgressNode[] = templateNodes.map((node) => {
       let status: 'pending' | 'active' | 'completed' = 'pending';
       if (node.step < stepNum) {
         status = 'completed';
@@ -413,6 +566,7 @@ class ProgressTracker {
       elapsedMs,
       elapsedSeconds,
       fileSizeLabel: this.fileSizeLabel,
+      pipelineMode: this.pipelineMode,
       nodes,
     });
   }
@@ -452,12 +606,15 @@ export class DwgViewerEngine {
   private mounted = false;
   private gpuInfo: GpuHardwareInfo = detectGpuHardware();
   private unmountProtection: (() => void) | null = null;
+  private resizeCleanup: (() => void) | null = null;
   private converter: CachedLibreDwgConverter | null = null;
   private lastResolvedCache: Omit<DwgCacheStatusInfo, 'totalElapsedMs'> | null = null;
   private currentFingerprint: string | null = null;
+  private memoryProfile: DeviceMemoryProfile;
 
   constructor(callbacks: DwgViewerCallbacks = {}) {
     this.callbacks = callbacks;
+    this.memoryProfile = getDeviceMemoryProfile();
     this.tracker = new ProgressTracker((state) => {
       this.callbacks.onProgress?.(state);
     });
@@ -469,6 +626,82 @@ export class DwgViewerEngine {
 
   public getCurrentFingerprint(): string | null {
     return this.currentFingerprint;
+  }
+
+  public getMemoryProfile(): DeviceMemoryProfile {
+    return this.memoryProfile;
+  }
+
+  /**
+   * Toggles the low-memory / anti-crash defense mode dynamically.
+   * Updates device memory profile, reconfigures WebGL pixelRatio, and schedules a view re-render.
+   */
+  public setDefenseMode(enabled: boolean): void {
+    this.memoryProfile = getDeviceMemoryProfile(enabled);
+    this.applyPixelRatioToView();
+  }
+
+  /**
+   * Applies the target pixel ratio from memory profile to the Three.js WebGL renderer
+   * to strictly prevent multi-hundred megabyte renderbuffer allocations on Retina screens.
+   */
+  private applyPixelRatioToView(view?: any): void {
+    const targetView = view || AcApDocManager.tryGetInstance()?.curView;
+    if (!targetView) return;
+    const threeRenderer =
+      targetView._renderer?._renderer ||
+      targetView._renderer?.renderer ||
+      targetView._renderer;
+    if (threeRenderer?.setPixelRatio) {
+      const dpr = Math.min(
+        typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
+        this.memoryProfile.targetPixelRatio
+      );
+      threeRenderer.setPixelRatio(dpr);
+      const w =
+        targetView.width ||
+        targetView._container?.clientWidth ||
+        parseInt(threeRenderer.domElement?.style?.width || '0', 10);
+      const h =
+        targetView.height ||
+        targetView._container?.clientHeight ||
+        parseInt(threeRenderer.domElement?.style?.height || '0', 10);
+      if (w && h && typeof threeRenderer.setSize === 'function') {
+        threeRenderer.setSize(w, h, false);
+      }
+      targetView._isDirty = true;
+      if (typeof targetView.render === 'function') {
+        try {
+          targetView.render();
+        } catch {
+          // Handled by continuous animation frame loop
+        }
+      }
+    }
+  }
+
+  /**
+   * Proactively aborts any ongoing background entity conversion and clears the previous drawing's
+   * Three.js scene and GPU buffers BEFORE decompressing or parsing a new drawing.
+   * Prevents the previous drawing (~150-200MB of WebGL geometries) from overlapping with the new
+   * drawing's decompression/model construction on iOS WebKit.
+   */
+  private async releasePreviousSceneBeforeLoad(): Promise<void> {
+    try {
+      const curView = AcApDocManager.tryGetInstance()?.curView as any;
+      if (!curView) return;
+      if (typeof curView.abortConversion === 'function') {
+        curView.abortConversion();
+      }
+      if (curView._scene && typeof curView._scene.clear === 'function') {
+        curView._scene.clear();
+      }
+      if (this.memoryProfile.defenseModeEnabled || this.memoryProfile.isMobile) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    } catch {
+      // Ignore scene cleanup errors before load
+    }
   }
 
   /**
@@ -512,11 +745,6 @@ export class DwgViewerEngine {
       { persist: false }
     );
 
-    const parserWorkerUrl = new URL(
-      '../workers/libredwgParserWorker.ts',
-      import.meta.url
-    ).href;
-
     this.converter = new CachedLibreDwgConverter(
       {
         parserWorkerUrl,
@@ -530,7 +758,9 @@ export class DwgViewerEngine {
           this.lastResolvedCache = info;
           this.currentFingerprint = info.fingerprint;
         },
-      }
+        getProfile: () => this.memoryProfile,
+      },
+      this.tracker
     );
     AcDbDatabaseConverterManager.instance.register(AcDbFileType.DWG, this.converter);
 
@@ -552,22 +782,55 @@ export class DwgViewerEngine {
     if (!docManager) return;
     (window as any).__cadDocManager = docManager;
 
+    // 🛡️ WebGL Framebuffer Initialization & iOS Safari Resize Guard:
+    // Respect active profile pixelRatio (1.25 on iOS/defense mode) immediately
+    // and guard against window resize events (e.g., iOS URL bar collapse) resetting DPR to 3.0.
+    if (docManager.curView) {
+      this.applyPixelRatioToView(docManager.curView);
+    }
+
+    if (typeof window !== 'undefined') {
+      const onWindowResize = () => {
+        if (this.memoryProfile.defenseModeEnabled || this.memoryProfile.isMobile) {
+          this.applyPixelRatioToView();
+        }
+      };
+      window.addEventListener('resize', onWindowResize, { passive: true });
+      this.resizeCleanup = () => {
+        window.removeEventListener('resize', onWindowResize);
+      };
+    }
+
     const bindProgressEvents = () => {
       const doc = docManager.curDocument;
       if (!doc) return;
       doc.database.events.openProgress.addEventListener((args: any) => {
         const pct = Math.min(99, Math.max(10, Math.round(args.percentage || 0)));
         const stageStr = String(args.stage);
+        const mode = this.tracker.getPipelineMode();
         if (stageStr === 'PARSE') {
-          this.tracker.setStage(
-            'WASM_DECODE',
-            Math.max(20, Math.min(55, pct)),
-            '正在检索本地 Gzip 缓存或调用 LibreDWG WASM 解算...'
-          );
+          if (mode === 'gzip_cache') {
+            this.tracker.setStage(
+              'WASM_DECODE',
+              Math.max(20, Math.min(55, pct)),
+              '已解压缓存，正在加载模型数据...'
+            );
+          } else {
+            this.tracker.setStage(
+              'WASM_DECODE',
+              Math.max(20, Math.min(55, pct)),
+              '正在解析图纸二进制结构...'
+            );
+          }
         } else if (stageStr === 'CONVERSION') {
-          const detail = args.subStage
-            ? `正在批量构建图元实体索引 (${args.subStage})...`
-            : '正在构建图层表与图元实体模型树...';
+          const detail =
+            mode === 'gzip_cache'
+              ? (args.subStage
+                  ? `正在加载图元实体 (${args.subStage})...`
+                  : '正在构建图层与实体模型...')
+              : (args.subStage
+                  ? `正在构建实体索引 (${args.subStage})...`
+                  : '正在提取图元并构建模型树...');
           this.tracker.setStage(
             'ENTITY_CONVERSION',
             Math.max(55, Math.min(82, pct)),
@@ -577,7 +840,7 @@ export class DwgViewerEngine {
           this.tracker.setStage(
             'FONT_LAYOUT',
             Math.max(82, Math.min(92, pct)),
-            '正在加载匹配 CAD SHX 矢量字库与排版文本...'
+            '正在加载矢量字库与文本排版...'
           );
         }
       });
@@ -603,6 +866,10 @@ export class DwgViewerEngine {
    * Destroys engine event listeners and context protections.
    */
   public destroy(): void {
+    if (this.resizeCleanup) {
+      this.resizeCleanup();
+      this.resizeCleanup = null;
+    }
     if (this.unmountProtection) {
       this.unmountProtection();
       this.unmountProtection = null;
@@ -624,27 +891,53 @@ export class DwgViewerEngine {
 
     const resolvedUrl = resolveMinioDwgUrl(trimmedUrl);
     const fileName = options.fileName || extractFileNameFromUrl(resolvedUrl);
-    this.tracker.start();
+
+    // =========================================================================
+    // 🛡️ 同名匹配优先法则 (Same-name Matching Rule Safeguard):
+    // 若目标是标准 .dwg 文件且未开启强制重新解析 (bypassCache !== true)：
+    // 先检查 L1 (IndexedDB) 与 L2 (服务端共享) 中是否存在同名 DWG 的 Gzip 缓存。
+    // 若命中，直接路由至 loadFromCachedFingerprint 进行极速加载，彻底免去大文件网络传输与 WASM 二进制解码！
+    // =========================================================================
+    if (!options.bypassCache && !isGzipCacheFile(fileName)) {
+      try {
+        const matchedCache = await findGzipCacheByFileName(fileName);
+        if (matchedCache && matchedCache.fingerprint) {
+          return await this.loadFromCachedFingerprint(matchedCache.fingerprint);
+        }
+      } catch {
+        // Fallback to standard network fetch
+      }
+    }
+
+    this.tracker.start('', 'detecting');
     this.tracker.setStage(
       'FETCH_OR_READ',
       5,
-      `正在从远程或本地静态源拉取 ${fileName}...`
+      `正在获取图纸文件 ${fileName}...`
     );
 
     try {
       const headers: Record<string, string> = { ...(options.headers || {}) };
-      if (options.satoken) {
-        headers['satoken'] = options.satoken;
+      const requestUrl = new URL(resolvedUrl, window.location.href);
+      if (requestUrl.origin !== window.location.origin) {
+        // Presigned URLs are fetched directly. MinIO credentials belong to the local proxy only.
+        for (const header of Object.keys(headers)) {
+          if (header.toLowerCase().startsWith('x-minio-')) delete headers[header];
+        }
       }
 
-      const response = await fetch(resolvedUrl, {
+      const fetchUrl =
+        resolvedUrl.startsWith('/') && !resolvedUrl.includes('?')
+          ? encodeURI(resolvedUrl)
+          : resolvedUrl;
+      const response = await fetch(fetchUrl, {
         method: 'GET',
         headers,
       });
 
       if (!response.ok) {
         throw new Error(
-          `文件读取失败 (HTTP ${response.status} ${response.statusText}) — 当前为 AI Studio 独立环境，如需测试本地 Gzip 缓存可直接切换顶部内置样图或上传本地 .dwg / .dwg.cache.gz 文件`
+          `文件读取失败 (HTTP ${response.status} ${response.statusText})：请检查文件地址或网络连接`
         );
       }
 
@@ -668,7 +961,7 @@ export class DwgViewerEngine {
             this.tracker.setStage(
               'FETCH_OR_READ',
               pct,
-              `读取数据流: ${formatByteSize(received)} / ${formatByteSize(contentLength)}...`
+              `正在下载数据: ${formatByteSize(received)} / ${formatByteSize(contentLength)}...`
             );
           }
         }
@@ -714,18 +1007,18 @@ export class DwgViewerEngine {
     }
 
     const fileSizeLabel = formatByteSize(buffer.byteLength);
-    this.tracker.start(fileSizeLabel);
+    this.tracker.start(fileSizeLabel, bypassCache ? 'dwg_full_parse' : 'detecting');
     this.tracker.setStage(
       'FETCH_OR_READ',
       12,
-      `读取文件 ${fileName} (${fileSizeLabel})，校验 DWG 文件头标识...`
+      `正在读取文件 ${fileName} (${fileSizeLabel}) 并校验格式...`
     );
 
     const headerInfo = inspectDwgHeader(buffer);
     if (!headerInfo.isDwg) {
       this.tracker.error();
       this.callbacks.onError?.(
-        `文件头校验失败 (${headerInfo.versionLabel})：请确认文件为真实的 AutoCAD .dwg 图纸或 .dwg.cache.gz 压缩缓存文件`
+        `文件头校验失败 (${headerInfo.versionLabel})：请确认为有效的 AutoCAD .dwg 图纸或 .dwg.cache.gz 缓存文件`
       );
       return false;
     }
@@ -739,14 +1032,48 @@ export class DwgViewerEngine {
     });
 
     try {
-      const ok = await docManager.openDocument(cleanDwgName, buffer, {
-        mode: AcEdOpenMode.Read,
-        openViewMode: AcApOpenViewMode.Extents,
-        progressiveRendering: false,
-        cooperativeYield: false,
-        skipSpatialIndex: false,
-        minimumChunkSize: 5000,
-      } as any);
+      await this.releasePreviousSceneBeforeLoad();
+      // =========================================================================
+      // 🛡️ 架构防卡死与防 OOM 核心配置 (DO NOT MODIFY / 严禁篡改):
+      // 【背景与痛点】:
+      // 针对 50MB+ 超大 DWG（如 66MB 和 50MB 样图等数十万图元图纸）：
+      // 1. 若 cooperativeYield=false 或 minimumChunkSize 过大(如 5000)，SDK 会在单个 JS 同步宏任务
+      //    中持续运行 30~50 秒，完全剥夺浏览器主线程让出机制，直接触发 Chrome "页面无响应" 弹窗！
+      // 2. 连续同步执行阻止了 V8 引擎进行增量垃圾回收 (GC)，导致数十万瞬时图元对象瞬间挤爆内存，
+      //    在手机端浏览器（iOS WebKit / Android Chrome 内存上限通常 1.0~1.5GB）引发致命 OOM 闪退！
+      // 【解决方案】:
+      // 1. cooperativeYield: 强制设为 true，驱动 AcDbBatchProcessing 定期调用 accmYieldToUi() 让出主线程。
+      // 2. progressiveRendering: 设为 true，实现渐进式增量渲染，保持 UI 60fps 顺畅刷新。
+      // 3. minimumChunkSize: 基于文件大小自适应计算 (大图 200~300，小图 1000)，平衡吞吐量与线程响应度。
+      // =========================================================================
+      const adaptiveChunkSize = calculateAdaptiveChunkSize(
+        {
+          byteLength: buffer.byteLength,
+        },
+        this.memoryProfile
+      );
+
+      let ok: boolean;
+      try {
+        ok = await docManager.openDocument(cleanDwgName, buffer, {
+          mode: AcEdOpenMode.Read,
+          openViewMode: AcApOpenViewMode.Extents,
+          progressiveRendering: true,
+          cooperativeYield: true,
+          skipSpatialIndex: false,
+          minimumChunkSize: adaptiveChunkSize,
+        } as any);
+      } catch (openErr: any) {
+        // 🛡️ 平滑降级 (AcTrScene No Layout Fallback):
+        // 针对部分缺乏图纸空间或 modelSpaceBtrId 未完成映射的异常，若当前文档已就绪则平滑放行，避免阻断渲染
+        const msg = String(openErr?.message || openErr);
+        if (msg.includes('No layout') || msg.includes('AcTrScene')) {
+          console.warn('[dwgViewerEngine] Suppressed AcTrScene layout warning during openDocument, continuing gracefully:', openErr);
+          ok = Boolean(docManager.curDocument);
+        } else {
+          throw openErr;
+        }
+      }
 
       if (!ok) {
         throw new Error(`无法解析 ${cleanDwgName}，请检查 DWG 图纸版本或数据完整性`);
@@ -755,7 +1082,7 @@ export class DwgViewerEngine {
       this.tracker.setStage(
         'WEBGL_RENDER',
         95,
-        '计算智能聚簇居中，构建 WebGL 视口呈现...'
+        '正在初始化视图范围并呈现图纸...'
       );
       this.ensureModelSpaceActive();
       this.configureInteractiveView();
@@ -811,16 +1138,23 @@ export class DwgViewerEngine {
     }
 
     const gzSizeLabel = formatByteSize(gzBuffer.byteLength);
-    this.tracker.start(gzSizeLabel);
+    this.tracker.start(gzSizeLabel, 'gzip_cache');
     this.tracker.setStage(
       'WASM_DECODE',
       25,
-      `正在通过 DecompressionStream('gzip') 解压本地缓存文件 ${fileName} (${gzSizeLabel})...`
+      `正在解压图纸缓存文件 ${fileName} (${gzSizeLabel})...`
     );
 
     try {
+      await this.releasePreviousSceneBeforeLoad();
       const t0 = performance.now();
-      const envelope = await decompressGzipToEnvelope(gzBuffer);
+      const envelope = await decompressGzipToEnvelope(
+        gzBuffer,
+        (pct, detail) => {
+          this.tracker.setStage('WASM_DECODE', pct, detail);
+        },
+        this.memoryProfile
+      );
       const decompressMs = Math.max(1, Math.round(performance.now() - t0));
 
       const gzBytes = new Uint8Array(gzBuffer);
@@ -837,17 +1171,43 @@ export class DwgViewerEngine {
       this.tracker.setStage(
         'ENTITY_CONVERSION',
         55,
-        `⚡ Gzip 解压完成 (耗时 ${decompressMs}ms)，0ms 跳过 WASM，正在构建 CAD 图元模型...`
+        `缓存解压完成 (${decompressMs}ms)，正在加载图纸模型...`
       );
 
-      const ok = await docManager.openDocument(cleanDwgName, stubBuffer, {
-        mode: AcEdOpenMode.Read,
-        openViewMode: AcApOpenViewMode.Extents,
-        progressiveRendering: false,
-        cooperativeYield: false,
-        skipSpatialIndex: false,
-        minimumChunkSize: 5000,
-      } as any);
+      // =========================================================================
+      // 🛡️ 架构防卡死与防 OOM 核心配置 (DO NOT MODIFY / 严禁篡改):
+      // Gzip 缓存流式解压后注入 CAD 模型时，同样涉及数十万图元的批量解析与挂载，
+      // 必须开启 cooperativeYield 与自适应分片，防止手机端解压后注入阶段 OOM 闪退。
+      // =========================================================================
+      const adaptiveChunkSize = calculateAdaptiveChunkSize(
+        {
+          byteLength: envelope.originalByteLength,
+          entityCount: envelope.entityCount,
+        },
+        this.memoryProfile
+      );
+
+      let ok: boolean;
+      try {
+        ok = await docManager.openDocument(cleanDwgName, stubBuffer, {
+          mode: AcEdOpenMode.Read,
+          openViewMode: AcApOpenViewMode.Extents,
+          progressiveRendering: true,
+          cooperativeYield: true,
+          skipSpatialIndex: false,
+          minimumChunkSize: adaptiveChunkSize,
+        } as any);
+      } catch (openErr: any) {
+        // 🛡️ 平滑降级 (AcTrScene No Layout Fallback):
+        // 针对部分缺乏图纸空间或 modelSpaceBtrId 未完成映射的异常，若当前文档已就绪则平滑放行，避免阻断渲染
+        const msg = String(openErr?.message || openErr);
+        if (msg.includes('No layout') || msg.includes('AcTrScene')) {
+          console.warn('[dwgViewerEngine] Suppressed AcTrScene layout warning during gzip cache openDocument, continuing gracefully:', openErr);
+          ok = Boolean(docManager.curDocument);
+        } else {
+          throw openErr;
+        }
+      }
 
       if (!ok) {
         throw new Error(`无法从 Gzip 缓存文件 ${fileName} 构建图纸模型`);
@@ -856,7 +1216,7 @@ export class DwgViewerEngine {
       this.tracker.setStage(
         'WEBGL_RENDER',
         95,
-        '计算智能聚簇居中，构建 WebGL 视口呈现...'
+        '正在初始化视图范围并呈现图纸...'
       );
       this.ensureModelSpaceActive();
       this.configureInteractiveView();
@@ -900,6 +1260,17 @@ export class DwgViewerEngine {
   }
 
   /**
+   * Alias for loadFromGzipCacheBuffer for compatibility
+   */
+  public async loadFromCacheBuffer(
+    fileName: string,
+    gzBuffer: ArrayBuffer,
+    sourceUrl?: string
+  ): Promise<boolean> {
+    return this.loadFromGzipCacheBuffer(fileName, gzBuffer, sourceUrl);
+  }
+
+  /**
    * Opens a drawing directly from the local IndexedDB Gzip cache store by its fingerprint
    * without needing to re-upload or re-fetch the original .dwg file.
    */
@@ -910,39 +1281,87 @@ export class DwgViewerEngine {
       return false;
     }
 
-    this.tracker.start();
+    this.tracker.start('', 'gzip_cache');
     this.tracker.setStage(
       'WASM_DECODE',
       25,
-      '正在从浏览器本地 Gzip 缓存库读取并流式解压图纸...'
+      '正在读取并解压本地缓存...'
     );
 
     try {
-      const hit = await getAndDecompressGzipCache(fingerprint);
+      await this.releasePreviousSceneBeforeLoad();
+      const hit = await getAndDecompressGzipCache(
+        fingerprint,
+        (pct, detail) => {
+          this.tracker.setStage('WASM_DECODE', pct, detail);
+        },
+        this.memoryProfile
+      );
       if (!hit || !hit.payload?.model) {
-        throw new Error('该本地 Gzip 缓存记录不存在或已过期');
+        throw new Error('该图纸缓存记录不存在或已过期');
       }
 
-      this.currentFingerprint = hit.meta.fingerprint;
-      const cleanDwgName = normalizeDwgFileNameForConverter(hit.meta.fileName);
+      const meta = hit.meta;
+      const decompressMs = hit.decompressMs;
+      const hitLayer = hit.hitLayer;
+      const payload = hit.payload;
+
+      // =========================================================================
+      // 🛡️ CRITICAL iOS JETSAM & WEBKIT GC SAFEGUARD (防 iPhone 闪退核心):
+      // 显式斩断 40MB+ gzBytes 二进制缓冲与中间包装引用，并主动微让出 20ms，
+      // 确保在进入 openDocument 创建 CAD 图元模型前，JavaScriptCore 能够完整回收瞬时内存！
+      // =========================================================================
+      (hit as any).gzBytes = null;
+      (hit as any).payload = null;
+
+      this.currentFingerprint = meta.fingerprint;
+      const cleanDwgName = normalizeDwgFileNameForConverter(meta.fileName);
       const stubToken = `idb_hit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      this.converter.registerStubPayload(stubToken, hit.payload);
+      this.converter.registerStubPayload(stubToken, payload);
       const stubBuffer = createDwgStubBuffer(stubToken);
+
+      // Brief yield to allow GC to sweep transient allocations
+      await new Promise((r) => setTimeout(r, 20));
 
       this.tracker.setStage(
         'ENTITY_CONVERSION',
         55,
-        `⚡ 本地 Gzip 缓存解压完成 (${hit.decompressMs}ms)，正在构建 ${hit.meta.entityCount} 个图元...`
+        `缓存解压完成 (${decompressMs}ms)，正在构建 ${meta.entityCount} 个图元...`
       );
 
-      const ok = await docManager.openDocument(cleanDwgName, stubBuffer, {
-        mode: AcEdOpenMode.Read,
-        openViewMode: AcApOpenViewMode.Extents,
-        progressiveRendering: false,
-        cooperativeYield: false,
-        skipSpatialIndex: false,
-        minimumChunkSize: 5000,
-      } as any);
+      // =========================================================================
+      // 🛡️ 架构防卡死与防 OOM 核心配置 (DO NOT MODIFY / 严禁篡改):
+      // 从本地/共享 IndexedDB 读取 Gzip 缓存反序列化注入时，必须开启协作式让出与自适应分片。
+      // =========================================================================
+      const adaptiveChunkSize = calculateAdaptiveChunkSize(
+        {
+          byteLength: meta.originalByteLength,
+          entityCount: meta.entityCount,
+        },
+        this.memoryProfile
+      );
+
+      let ok: boolean;
+      try {
+        ok = await docManager.openDocument(cleanDwgName, stubBuffer, {
+          mode: AcEdOpenMode.Read,
+          openViewMode: AcApOpenViewMode.Extents,
+          progressiveRendering: true,
+          cooperativeYield: true,
+          skipSpatialIndex: false,
+          minimumChunkSize: adaptiveChunkSize,
+        } as any);
+      } catch (openErr: any) {
+        // 🛡️ 平滑降级 (AcTrScene No Layout Fallback):
+        // 针对部分缺乏图纸空间或 modelSpaceBtrId 未完成映射的异常，若当前文档已就绪则平滑放行，避免阻断渲染
+        const msg = String(openErr?.message || openErr);
+        if (msg.includes('No layout') || msg.includes('AcTrScene')) {
+          console.warn('[dwgViewerEngine] Suppressed AcTrScene layout warning during gzip cache openDocument, continuing gracefully:', openErr);
+          ok = Boolean(docManager.curDocument);
+        } else {
+          throw openErr;
+        }
+      }
 
       if (!ok) {
         throw new Error(`无法从缓存渲染图纸 ${cleanDwgName}`);
@@ -951,7 +1370,7 @@ export class DwgViewerEngine {
       this.tracker.setStage(
         'WEBGL_RENDER',
         95,
-        '计算智能聚簇居中，构建 WebGL 视口呈现...'
+        '正在初始化视图范围并呈现图纸...'
       );
       this.ensureModelSpaceActive();
       this.configureInteractiveView();
@@ -962,18 +1381,18 @@ export class DwgViewerEngine {
 
       const cacheInfo: DwgCacheStatusInfo = {
         source:
-          hit.hitLayer === 'server-shared' ? 'server-gzip-shared' : 'local-gzip-idb',
-        fingerprint: hit.meta.fingerprint,
+          hitLayer === 'server-shared' ? 'server-gzip-shared' : 'local-gzip-idb',
+        fingerprint: meta.fingerprint,
         fileName: cleanDwgName,
-        originalByteLength: hit.meta.originalByteLength,
-        rawJsonBytes: hit.meta.rawJsonBytes,
-        compressedBytes: hit.meta.compressedBytes,
-        compressionRatio: hit.meta.compressionRatio,
-        wasmParseMs: hit.meta.wasmParseMs,
-        decompressMs: hit.decompressMs,
+        originalByteLength: meta.originalByteLength,
+        rawJsonBytes: meta.rawJsonBytes,
+        compressedBytes: meta.compressedBytes,
+        compressionRatio: meta.compressionRatio,
+        wasmParseMs: meta.wasmParseMs,
+        decompressMs,
         totalElapsedMs,
-        entityCount: hit.meta.entityCount,
-        layerCount: hit.meta.layerCount,
+        entityCount: meta.entityCount,
+        layerCount: meta.layerCount,
       };
 
       this.callbacks.onLoaded?.({
@@ -987,7 +1406,7 @@ export class DwgViewerEngine {
       return true;
     } catch (err: any) {
       this.tracker.error();
-      this.callbacks.onError?.(err?.message || '从本地 Gzip 缓存加载失败');
+      this.callbacks.onError?.(err?.message || '从图纸缓存加载失败');
       return false;
     }
   }
@@ -1031,57 +1450,235 @@ export class DwgViewerEngine {
   /**
    * Automatically switches from an empty Paper Space layout to Model Space
    * if the DWG was saved on an unpopulated layout tab.
+   *
+   * 🛡️ 防御加固 (AcTrScene No Layout Defense):
+   * 1. 判空防崩：严格校验 docManager.curDocument、database、tables 及 blockTable 存在性；
+   * 2. 安全短路：若当前激活空间已经是模型空间（activeBtr === modelId），或当前图纸空间已包含实体（>= 5），安全短路；
+   * 3. 布局有效性校验：校验 layoutManager 存在性，防止未就绪时调用抛出致命未捕获异常。
    */
   private ensureModelSpaceActive(): void {
     const docManager = AcApDocManager.tryGetInstance();
-    if (!docManager) return;
+    if (!docManager || !docManager.curDocument) return;
     (window as any).__cadDocManager = docManager;
 
     const db = docManager.curDocument.database;
+    if (!db || !db.tables || !db.tables.blockTable) return;
+
     const blockTable = db.tables.blockTable;
     const modelSpace = blockTable.modelSpace;
-    const modelId = modelSpace.objectId;
-    const modelEntityCount = modelSpace ? modelSpace.newIterator().count : 0;
+    if (!modelSpace) return;
 
+    const modelId = modelSpace.objectId;
     const activeBtr = db.currentSpaceId || modelId;
-    if (activeBtr !== modelId) {
-      const currentPaperBtr = blockTable.getIdAt(activeBtr);
-      const currentPaperCount = currentPaperBtr ? currentPaperBtr.newIterator().count : 0;
-      if (currentPaperCount < 5 && modelEntityCount > currentPaperCount) {
-        try {
-          acdbHostApplicationServices().layoutManager.setCurrentLayoutBtrId(modelId, db);
-        } catch {
-          // Ignore if layout switch is not needed
+
+    // 🛡️ 空间短路：如果当前激活空间已经是模型空间，无需任何切换，避免引发事件乱序与重复布局校验
+    if (activeBtr === modelId) {
+      return;
+    }
+
+    const modelEntityCount = modelSpace.newIterator ? modelSpace.newIterator().count : 0;
+    const currentPaperBtr = blockTable.getIdAt ? blockTable.getIdAt(activeBtr) : null;
+    const currentPaperCount = currentPaperBtr && currentPaperBtr.newIterator ? currentPaperBtr.newIterator().count : 0;
+
+    // 🛡️ 防御短路：仅当当前图纸空间为空（图元数极少 < 5）且模型空间有实质图元时，才安全切换至模型空间
+    if (currentPaperCount < 5 && modelEntityCount > currentPaperCount) {
+      try {
+        const layoutMgr = acdbHostApplicationServices()?.layoutManager;
+        if (layoutMgr && typeof layoutMgr.setCurrentLayoutBtrId === 'function') {
+          layoutMgr.setCurrentLayoutBtrId(modelId, db);
         }
+      } catch (err) {
+        // Safe fallback: 降级告警并安全跳过，防止布局管理器未完成初始化时抛出致命异常
+        console.warn('[dwgViewerEngine] Safe warning: setCurrentLayoutBtrId skipped:', err);
       }
     }
   }
 
   /**
    * Centers and fits the drawing in the viewport (automatically ignoring stray outlier points).
+   *
+   * 🌟 深度工程背景与离散图元智能聚焦防御 (Statistical Cluster Framing):
+   * 1. 痛点：许多工程 DWG（如 66MB 工程图等高斯/CGCS2000 大地测量坐标图）在图层 "0" 或历史模板中残留了极端离散图元/孤立孤点
+   *    （如坐标高达 6500万，而真实图层集中在 3260万）；同时 DWG 文件头自带被污染的 $EXTMIN/$EXTMAX。
+   * 2. SDK 缺陷：SDK 内部 `applyInitialZoom` 会无脑读取 dirty $EXTMIN/$EXTMAX，将视口拉到几万公里高空；
+   *    且其 `resolveSmartFitBox` 内置了 1e10 (100亿) 宽容度阈值，无法过滤千万级离散图层。
+   * 3. 解决策略：
+   *    - 遍历 `activeLayout.layers` 中所有非空图层包围盒；
+   *    - 采用中位数统计法（Median Center & Median Span），动态识别并剔除偏离主体坐标系超限的极端离散图层；
+   *    - 构造满足 Three-Renderer 契约的 Vector 结果盒（实现 getSize/getCenter 写入回传），调用 view.zoomTo(box, 1.08)；
+   *    - 标记 `view.markLayoutAsInitialized` 与 `_externallyFramedLayouts`，阻断 SDK 异步定时器回弹重置视口；
+   *    - 若图元正在流式分批转换中（`view.isProcessingEntities`），启动自适应监听，在全部图元转换完毕后自动再次执行精细聚焦。
    */
   public async fitToView(): Promise<void> {
     const docManager = AcApDocManager.tryGetInstance();
     if (!docManager) return;
     (window as any).__cadDocManager = docManager;
-    try {
-      await docManager.curView.zoomToSmartExtents(15000);
-      const smartBox = await (docManager.curView as any).resolveSmartFitBox?.();
-      if (smartBox && !smartBox.isEmpty?.()) {
-        docManager.curView.zoomTo(smartBox, 1.08);
+    const view = docManager.curView;
+    if (!view) return;
+
+    this.applyClusterFraming(view);
+
+    // If progressive conversion is still processing in background, schedule a final fit when idle
+    if (typeof (view as any).isProcessingEntities === 'function' && (view as any).isProcessingEntities()) {
+      const btrId = (view as any).activeLayoutBtrId;
+      if (btrId && (view as any)._externallyFramedLayouts) {
+        (view as any)._externallyFramedLayouts.add(btrId);
       }
-    } catch {
+      this.schedulePostConvertRefit(view);
+    }
+  }
+
+  /**
+   * Schedules a one-time refit when background entity conversion completely drains.
+   */
+  private schedulePostConvertRefit(view: any): void {
+    let attempts = 0;
+    const maxAttempts = 120; // 60 seconds (500ms intervals)
+    const checkInterval = setInterval(() => {
+      attempts++;
+      if (!view || !view._scene) {
+        clearInterval(checkInterval);
+        return;
+      }
+      const isProcessing = typeof view.isProcessingEntities === 'function' && view.isProcessingEntities();
+      if (!isProcessing || attempts >= maxAttempts) {
+        clearInterval(checkInterval);
+        this.applyClusterFraming(view);
+      }
+    }, 500);
+  }
+
+  /**
+   * Calculates dominant cluster bounding box across all active layers using statistical median filtering,
+   * completely ignoring astronomical coordinate outliers (e.g. layer "0" at 65,000,000 while drawing is at 32,600,000).
+   */
+  private applyClusterFraming(view: any): boolean {
+    const layout = view._scene?.activeLayout;
+    if (!layout) {
       try {
-        docManager.curView.zoomToFitDrawing();
+        view.zoomToFitDrawing?.();
+        return true;
       } catch {
-        // Ignore if view is not yet ready
+        return false;
       }
+    }
+
+    const layerBoxes: Array<{
+      name: string;
+      minX: number;
+      minY: number;
+      maxX: number;
+      maxY: number;
+      centerX: number;
+      centerY: number;
+      spanX: number;
+      spanY: number;
+    }> = [];
+
+    if (layout.layers) {
+      layout.layers.forEach((layer: any, name: string) => {
+        if (layer.box && !layer.box.isEmpty()) {
+          const b = layer.box;
+          layerBoxes.push({
+            name,
+            minX: b.min.x,
+            minY: b.min.y,
+            maxX: b.max.x,
+            maxY: b.max.y,
+            centerX: (b.min.x + b.max.x) / 2,
+            centerY: (b.min.y + b.max.y) / 2,
+            spanX: b.max.x - b.min.x,
+            spanY: b.max.y - b.min.y,
+          });
+        }
+      });
+    }
+
+    // Fallback if no layer boxes exist yet
+    if (layerBoxes.length === 0) {
+      try {
+        view.zoomToFitDrawing?.();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    // 1. Calculate statistical medians across all layers
+    const sortedX = layerBoxes.map((b) => b.centerX).sort((a, b) => a - b);
+    const sortedY = layerBoxes.map((b) => b.centerY).sort((a, b) => a - b);
+    const medX = sortedX[Math.floor(sortedX.length / 2)];
+    const medY = sortedY[Math.floor(sortedY.length / 2)];
+
+    const sortedSpans = layerBoxes.map((b) => Math.max(b.spanX, b.spanY)).sort((a, b) => a - b);
+    const medSpan = sortedSpans[Math.floor(sortedSpans.length / 2)] || 1000;
+
+    // 2. Reject outlier layers whose center deviates wildly from cluster median
+    // (e.g. layer "0" at 6500万 vs drawing at 3260万)
+    const maxAllowedDist = Math.max(medSpan * 15, 60000);
+    const kept = layerBoxes.filter((b) => {
+      const dist = Math.hypot(b.centerX - medX, b.centerY - medY);
+      return dist <= maxAllowedDist;
+    });
+
+    const activeLayers = kept.length > 0 ? kept : layerBoxes;
+
+    // 3. Union filtered layers
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+
+    for (const b of activeLayers) {
+      minX = Math.min(minX, b.minX);
+      minY = Math.min(minY, b.minY);
+      maxX = Math.max(maxX, b.maxX);
+      maxY = Math.max(maxY, b.maxY);
+    }
+
+    // 4. Construct Three-Renderer compatible Box with vector-writing getSize & getCenter
+    const targetBox = {
+      min: { x: minX, y: minY },
+      max: { x: maxX, y: maxY },
+      getSize: (out?: any) => {
+        if (out) {
+          out.x = maxX - minX;
+          out.y = maxY - minY;
+        }
+        return out || { x: maxX - minX, y: maxY - minY };
+      },
+      getCenter: (out?: any) => {
+        if (out) {
+          out.x = (minX + maxX) / 2;
+          out.y = (minY + maxY) / 2;
+        }
+        return out || { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+      },
+      isEmpty: () => false,
+    };
+
+    try {
+      view.zoomTo(targetBox, 1.08);
+      const btrId = view.activeLayoutBtrId;
+      if (btrId) {
+        if (typeof view.markLayoutAsInitialized === 'function') {
+          view.markLayoutAsInitialized(btrId);
+        }
+        if (view._externallyFramedLayouts) {
+          view._externallyFramedLayouts.add(btrId);
+        }
+      }
+      view._isDirty = true;
+      return true;
+    } catch {
+      return false;
     }
   }
 
   /**
    * Configures CAD viewport interactive behavior:
    * Enables entity hover-highlight, sets optimal pick tolerance, and reduces hover response latency.
+   * [09_viewport_interaction] 默认鼠标左键拖拽平移与空格抓手映射：默认模式配置为平移漫游 (AcEdViewMode.PAN = 1)
    */
   public configureInteractiveView(): void {
     const docManager = AcApDocManager.tryGetInstance();
@@ -1091,7 +1688,8 @@ export class DwgViewerEngine {
     if (!view) return;
 
     view.entitySelectionEnabled = true;
-    (view as any).mode = 0; // AcEdViewMode.SELECTION
+    // [09_viewport_interaction] 默认鼠标左键拖拽平移与空格抓手映射：默认模式设为平移漫游 (PAN = 1)
+    this.setViewMode('pan');
     view.selectionBoxSize = 6;
 
     const hoverCtrl = (view as any)._hoverController;
@@ -1099,5 +1697,47 @@ export class DwgViewerEngine {
       hoverCtrl.hoverDelay = 80;
       hoverCtrl.pauseDelay = 100;
     }
+
+    // 🛡️ WebGL Framebuffer & Jetsam Memory Protection:
+    // Strictly adhere to targetPixelRatio (1.25 on iOS/defense mode, 1.5 on mobile, 2.0 on desktop)
+    // to prevent 100MB+ WebGL renderbuffers causing out-of-memory WebGL context loss.
+    this.applyPixelRatioToView(view);
+  }
+
+  /**
+   * [09_viewport_interaction] 动态切换视口交互模式（平移漫游 vs 框选）
+   * @param mode 'pan' 为平移漫游模式 (AcEdViewMode.PAN = 1)，'select' 为框选模式 (AcEdViewMode.SELECTION = 0)
+   */
+  public setViewMode(mode: 'pan' | 'select'): void {
+    const docManager = AcApDocManager.tryGetInstance();
+    if (!docManager) return;
+    const view = docManager.curView;
+    if (!view) return;
+    (view as any).mode = mode === 'pan' ? AcEdViewMode.PAN : AcEdViewMode.SELECTION;
+
+    // [09_viewport_interaction] 加固底层相机控制器鼠标映射，确保平移模式下左键与中键双通道平移
+    const activeLayoutView = (view as any).activeLayoutView;
+    const controls = activeLayoutView?._cameraControls || (view as any)._cameraControls;
+    if (controls && controls.mouseButtons) {
+      if (mode === 'pan') {
+        controls.mouseButtons.LEFT = 2; // THREE.MOUSE.PAN (2)
+        controls.mouseButtons.MIDDLE = 2; // THREE.MOUSE.PAN (2)
+      } else {
+        delete controls.mouseButtons.LEFT;
+        controls.mouseButtons.MIDDLE = 2;
+      }
+      controls.update?.();
+    }
+  }
+
+  /**
+   * [09_viewport_interaction] 查询当前视口是否处于平移漫游模式
+   */
+  public isPanMode(): boolean {
+    const docManager = AcApDocManager.tryGetInstance();
+    if (!docManager) return true;
+    const view = docManager.curView;
+    if (!view) return true;
+    return (view as any).mode === AcEdViewMode.PAN;
   }
 }

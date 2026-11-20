@@ -1,20 +1,32 @@
 @import "tailwindcss";
 
+/* [03_ui_design 移动端断点适配] 定义小屏手机 xs 响应式断点 (380px) */
+@theme {
+  --breakpoint-xs: 380px;
+}
+
 @layer base {
   :root {
-    --font-sans: 'Plus Jakarta Sans', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    --font-mono: 'JetBrains Mono', 'Noto Sans SC', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+    --font-mono: 'JetBrains Mono', 'Cascadia Mono', 'Consolas', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-left: env(safe-area-inset-left, 0px);
+    --safe-right: env(safe-area-inset-right, 0px);
   }
 
   html, body, #root {
     height: 100%;
+    height: 100dvh;
     width: 100%;
     margin: 0;
     padding: 0;
     overflow: hidden;
+    background-color: #0F1117;
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
 
   body {
@@ -36,3 +48,219 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+/* 移动端动态视口与安全区域工具类 (iOS 刘海屏 / 灵动岛 / Home Indicator & Android 手势条) */
+.h-dvh-safe {
+  height: 100vh;
+  height: 100dvh;
+}
+
+.pt-safe {
+  padding-top: max(0.5rem, env(safe-area-inset-top, 0px));
+}
+
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+}
+
+.px-safe {
+  padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+  padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+}
+
+/* 隐藏横向分段栏滚动条 */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* 细腻克制的自定义滚动条样式 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.2);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.35);
+}
+
+/* [03_ui_design 动画动效] 下拉弹窗渐出与配置面板展开动效 */
+@keyframes dropdownFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes panelSlideDown {
+  0% {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-dropdown-fade {
+  animation: dropdownFadeIn 180ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  transform-origin: top;
+  will-change: transform, opacity;
+}
+
+.animate-panel-slide {
+  animation: panelSlideDown 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform, opacity;
+}
+
+/* [03_ui_design] 首屏渐进式启动骨架微光动效 */
+@keyframes splashPulse {
+  0%, 100% {
+    opacity: 0.4;
+    transform: scale(0.98);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.03);
+  }
+}
+
+/* [03_ui_design] 彻底屏蔽 @mlightcad/cad-simple-viewer 自带的黑底 ML 全局遮罩与文字，由自研五步阻尼进度条统管加载反馈 */
+.ml-ccl-overlay {
+  display: none !important;
+}
+
+
+
+/* 工作台与预览器共用的中性色阶 */
+@theme {
+  --color-sky-200: #eeeeef;
+  --color-sky-300: #dedee1;
+  --color-sky-400: #ceced2;
+  --color-sky-500: #bdbdc3;
+  --color-sky-950: #18181a;
+}
+
+.app-toolbar {
+  height: auto;
+  min-height: 52px;
+  padding: max(6px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 6px max(12px, env(safe-area-inset-left));
+  justify-content: flex-start;
+  overflow: visible;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.app-toolbar [data-section] { background: transparent; border: 0; padding: 0; gap: 2px; }
+.app-toolbar [data-section="display"] { max-width: min(28%, 300px); }
+.app-toolbar button[title]:not(.source-menu button) {
+  justify-content: center; min-width: 36px; min-height: 36px; border-color: transparent; background-color: transparent;
+}
+.app-toolbar button[title]:hover:not(:disabled), .app-toolbar button[aria-expanded="true"], .app-toolbar button[aria-pressed="true"] { background: #373739; }
+.app-toolbar [data-section="config"] > div { border: 0; background: transparent; }
+button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #bec7cf; outline-offset: 2px; }
+
+.workbench { position: absolute; inset: 0; overflow-y: auto; background: #111112; color: #f1f1f2; }
+.workbench-inner { max-width: 1560px; margin: auto; padding: clamp(20px, 3.5vw, 56px) max(16px, 3vw, env(safe-area-inset-left)) max(32px, env(safe-area-inset-bottom)); }
+.desk-heading { display: flex; align-items: center; gap: 12px; padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid #353537; }
+.desk-heading h1 { font-size: clamp(23px, 2vw, 31px); line-height: 1.25; font-weight: 600; letter-spacing: -.04em; }
+.source-grid { display: grid; grid-template-columns: 1.1fr 1.1fr .9fr; gap: clamp(12px, 1.4vw, 24px); align-items: start; }
+.source-panel { min-width: 0; padding: clamp(14px, 1.4vw, 22px); border: 1px solid #343436; border-radius: 14px; background: #1b1b1d; }
+.source-heading, .cache-heading, .about-heading { display: flex; align-items: center; gap: 9px; }
+.source-heading > svg { width: 20px; color: #cfcfd3; flex-shrink: 0; }
+.source-heading h2, .about-heading h2 { font-size: 17px; font-weight: 600; }
+.source-actions, .about-heading > button, .cache-heading > button { margin-left: auto; }
+.source-actions { display: flex; }
+.icon-action { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 8px; color: #c4c4c8; cursor: pointer; }
+.icon-action svg { width: 17px; height: 17px; }
+.icon-action:hover, .icon-action:focus-visible { background: #373739; color: white; }
+.icon-action:disabled { opacity: .5; cursor: default; }
+.source-controls { display: grid; gap: 12px; margin: 16px 0; }
+.source-values, .drawing-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.value-tag { display: inline-flex; gap: 6px; align-items: baseline; max-width: 100%; min-width: 0; padding: 3px 7px; border-radius: 5px; background: #303033; color: #dedee1; font: 12px/1.45 var(--font-mono); overflow-wrap: anywhere; transition: background-color .15s; }
+.value-tag, .value-tag *, .object-path, .drawing-name, input { user-select: text; -webkit-user-select: text; -webkit-touch-callout: default; }
+.value-tag:hover { background: #404045; }
+.tag-label { opacity: .8; flex: none; font-family: var(--font-sans); }
+.tone-info { background: #2a373e; color: #cbdfe9; }
+.tone-info:hover { background: #37474f; }
+.tone-ready { background: #25382e; color: #bbddc5; }
+.tone-ready:hover { background: #34493b; }
+.tone-warning { background: #403529; color: #e7cba6; }
+.tone-warning:hover { background: #4e4236; }
+.object-input { display: flex; padding: 2px 4px 2px 10px; gap: 4px; align-items: center; border: 1px solid #454548; border-radius: 8px; background: #151516; }
+.object-input input { min-width: 0; flex: 1; font-size: 14px; }
+.recent-paths { font-size: 13px; color: #c4c4c8; }
+.recent-paths summary { cursor: pointer; }
+.recent-paths button { display: block; text-align: left; max-width: 100%; overflow-wrap: anywhere; padding: 4px 0; }
+.drawing-list { max-height: min(56vh, 600px); overflow: auto; }
+.drawing-row { display: flex; gap: 10px; align-items: center; border-top: 1px solid #333336; padding: 11px 0; }
+.drawing-row > svg { color: #a3a3a8; flex-shrink: 0; }
+.drawing-info { min-width: 0; flex: 1; }
+.drawing-name { display: block; max-width: 100%; text-align: left; font-size: 14px; line-height: 1.45; font-weight: 500; overflow-wrap: anywhere; cursor: pointer; }
+.drawing-name:hover { text-decoration: underline; }
+.drawing-meta { margin-top: 4px; }
+.object-path { display: block; overflow-wrap: anywhere; margin-top: 4px; font-size: 12px; color: #b0b0b6; }
+.empty-list { padding: 16px 0 6px; border-top: 1px solid #343436; color: #b5b5bb; font-size: 14px; }
+.file-drop { display: grid; place-items: center; gap: 5px; border: 1px dashed #606064; border-radius: 10px; min-height: 124px; background: #222224; }
+.file-drop:hover { background: #2b2b2d; border-color: #b3b3b8; }
+.file-drop strong { font-size: 15px; font-weight: 550; }
+.file-drop span, .save-choice, .cache-heading h3 { font-size: 13px; color: #c4c4ca; }
+.save-choice { display: flex; gap: 8px; align-items: center; min-height: 28px; }
+.save-choice input { accent-color: #ddd; }
+.about-details > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid #38383b; }
+.about-details dt { color: #c2c2c7; font-size: 14px; }
+@media (max-width: 1023px) {
+  .source-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+}
+@media (max-width: 720px) {
+  .source-grid { grid-template-columns: minmax(0,1fr); }
+  .workbench-inner { padding-top: 22px; }
+  .desk-heading { margin-bottom: 14px; padding-bottom: 14px; }
+  .app-toolbar [data-section="display"] { max-width: 100%; }
+  .app-toolbar .source-menu { position: absolute; top: 100%; left: 8px; right: auto; width: min(410px, calc(100vw - 16px)); max-height: 65dvh; overflow-y: auto; }
+  .app-toolbar [data-section="interaction"] > div { position: static; }
+}
+@media (pointer: coarse) {
+  .icon-action, .app-toolbar button[title]:not(.source-menu button) { min-height: 44px; min-width: 44px; }
+}
+.about-dialog { position: fixed; inset: 0; margin: auto; width: min(380px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 22px; color: #f1f1f2; background: #202022; border: 1px solid #454548; border-radius: 14px; }
+.about-dialog::backdrop { background: rgb(0 0 0 / 65%); }
+.about-heading { margin-bottom: 14px; }
+.drawing-name { cursor: text; }
+.drawing-name:hover { text-decoration: none; }
+.drawing-name .value-tag { font: 500 14px/1.5 var(--font-sans); background: #28282b; }
+.drawing-name .value-tag:hover { background: #37373a; }
+.resource-meter { display: inline-flex; flex: none; align-items: center; gap: 9px; padding: 5px 9px; margin-right: 5px; color: #dadade; background: #252527; border: 1px solid #39393c; border-radius: 8px; font: 12px/1.4 var(--font-mono); font-variant-numeric: tabular-nums; user-select: text; }
+.resource-meter > span { display: inline-flex; align-items: center; gap: 5px; }
+.resource-meter > span + span { border-left: 1px solid #49494c; padding-left: 9px; }
+.resource-meter b { font-weight: 500; min-width: 5ch; text-align: right; }
+.resource-meter svg[viewBox="0 0 44 16"] { width: 38px; height: 16px; color: #94b3a7; }
+@media (max-width: 1100px) { .resource-meter svg[viewBox="0 0 44 16"] { display: none; } }
+@media (max-width: 720px) { .app-toolbar [data-section="config"] { max-width: 100%; flex-wrap: wrap; } }
+.app-toolbar .utility-popover { position: absolute; top: calc(100% + 5px); right: 8px; max-height: min(72dvh, 620px); overflow: auto; width: min(470px, calc(100% - 16px)); padding: 12px; border: 1px solid #464648; border-radius: 12px; box-shadow: 0 14px 36px #0008; }
+.app-toolbar .gpu-popover { width: min(360px,calc(100% - 16px)); align-items: flex-start; }
+.gpu-popover .value-tag { margin: 3px 0; }
+.cache-actions button { min-height: 30px; }
+.app-toolbar .memory-tip-host > button { min-width: 36px; min-height: 36px; justify-content: center; }
+.app-toolbar .memory-tip { z-index: 45; top: 100%; width: min(360px,calc(100% - 16px)); background: #252527; color: #ededee; font: 14px/1.5 var(--font-sans); }
+.memory-tip-host { align-self: stretch; display: flex; align-items: center; }
+.memory-tip-host::after { content: ''; position: absolute; width: 36px; height: 9px; bottom: 0; pointer-events: none; }
+.memory-tip-host:hover::after { pointer-events: auto; }
+.memory-tip p { background: #303033; border-radius: 7px; padding: 8px 10px; margin-top: 6px; color: #dedee1; }

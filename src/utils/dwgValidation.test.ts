@@ -9,7 +9,7 @@ import {
 } from './dwgValidation.ts';
 
 test('validateDwgFileName strictly accepts .dwg and rejects non-dwg extensions', () => {
-  assert.equal(validateDwgFileName('01俄洛镇格巴村总平图.dwg').valid, true);
+  assert.equal(validateDwgFileName('示例总平面图.dwg').valid, true);
   assert.equal(validateDwgFileName('SITE_PLAN.DWG').valid, true);
   assert.equal(validateDwgFileName('building.rvt').valid, false);
   assert.equal(validateDwgFileName('drawing.dxf').valid, false);
@@ -33,49 +33,53 @@ test('formatByteSize formats KB and MB accurately', () => {
   assert.equal(formatByteSize(0), '0 B');
 });
 
-test('extractFileNameFromUrl extracts .dwg file name from MinIO presigned and internal URLs', () => {
+test('extractFileNameFromUrl extracts .dwg file name from MinIO presigned and stream URLs', () => {
   assert.equal(
     extractFileNameFromUrl(
-      'http://192.168.1.50:9000/cad-bucket/2026/%E6%80%BB%E5%B9%B3%E5%9B%BE.dwg?X-Amz-Signature=abc123'
+      'http://storage.example.invalid:9000/drawings/dwg/%E6%80%BB%E5%B9%B3%E5%9B%BE.dwg?X-Amz-Signature=abc123'
     ),
     '总平图.dwg'
   );
   assert.equal(
-    extractFileNameFromUrl('/samples/baseline-sample.dwg'),
-    'baseline-sample.dwg'
+    extractFileNameFromUrl('/samples/canteen.dwg'),
+    'canteen.dwg'
   );
   assert.equal(
-    extractFileNameFromUrl('https://api.internal/spring/files/download/9921'),
+    extractFileNameFromUrl('https://api.internal/files/download/9921'),
     '9921.dwg'
   );
   assert.equal(
     extractFileNameFromUrl(
-      'http://192.168.81.163:9008/api/minio/get_file?path=nonglintu/dwg/01%E4%BF%84%E6%B4%9B%E9%95%87%E6%A0%BC%E5%B7%B4%E6%9D%91%E6%80%BB%E5%B9%B3%E5%9B%BE.dwg'
+      '/api/minio/stream?path=drawings%2Fdwg%2F%E7%A4%BA%E4%BE%8B%E6%80%BB%E5%B9%B3%E9%9D%A2%E5%9B%BE.dwg'
     ),
-    '01俄洛镇格巴村总平图.dwg'
+    '示例总平面图.dwg'
   );
 });
 
-test('resolveMinioDwgUrl normalizes relative paths, console URLs, and legacy URLs', () => {
+test('resolveMinioDwgUrl normalizes relative paths, MinIO console URLs, and S3 direct URLs', () => {
   assert.equal(
-    resolveMinioDwgUrl('/samples/baseline-sample.dwg'),
-    '/samples/baseline-sample.dwg'
+    resolveMinioDwgUrl('/samples/canteen.dwg'),
+    '/samples/canteen.dwg'
   );
   assert.equal(
     resolveMinioDwgUrl('samples/canteen.dwg'),
     '/samples/canteen.dwg'
   );
   assert.equal(
-    resolveMinioDwgUrl('nonglintu/dwg/01.dwg'),
-    'http://192.168.81.163:9008/api/minio/get_file?path=nonglintu%2Fdwg%2F01.dwg&preview=true&inline=true'
+    resolveMinioDwgUrl('drawings/dwg/01.dwg'),
+    '/api/minio/stream?path=drawings%2Fdwg%2F01.dwg'
   );
   assert.equal(
-    resolveMinioDwgUrl('http://minio:9090/browser/nonglintu/dwg%2F01.dwg'),
-    'http://192.168.81.163:9008/api/minio/get_file?path=nonglintu%2Fdwg%2F01.dwg&preview=true&inline=true'
+    resolveMinioDwgUrl('http://storage.example.invalid:9090/browser/drawings/dwg%2F01.dwg'),
+    '/api/minio/stream?path=drawings%2Fdwg%2F01.dwg'
   );
   assert.equal(
-    resolveMinioDwgUrl('http://192.168.81.163:9008/api/feqi/minio/get_file?path=test.dwg'),
-    'http://192.168.81.163:9008/api/minio/get_file?path=test.dwg&preview=true&inline=true'
+    resolveMinioDwgUrl('http://storage.example.invalid:9000/drawings/dwg/01.dwg'),
+    '/api/minio/stream?path=drawings%2Fdwg%2F01.dwg'
+  );
+  assert.equal(
+    resolveMinioDwgUrl('/api/minio/stream?path=drawings%2Fdwg%2F01.dwg'),
+    '/api/minio/stream?path=drawings%2Fdwg%2F01.dwg'
   );
 });
 

@@ -1,0 +1,25 @@
+appId: com.dwgviewer.app
+productName: DWG-viewer
+directories:
+  output: release/${version}
+files:
+  - "dist/**/*"
+  - "electron/main.cjs"
+  - "electron/preload.cjs"
+  - "electron/server.cjs"
+  - "public/**/*"
+  - "package.json"
+win:
+  icon: "build/icon.ico"
+  target:
+    - nsis
+  fileAssociations:
+    - ext: dwg
+      name: AutoCAD DWG File
+      role: Viewer
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  artifactName: "${productName}-${version}-${arch}-Setup.${ext}"

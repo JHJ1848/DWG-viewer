@@ -53,7 +53,7 @@
 │   │   └── mtext-renderer-worker.js  # MTEXT 多行文本与 SHX 矢量字体几何排版 Worker
 │   ├── fonts/                        # CAD 矢量字体库 (.shx / 中文字体，解决中文乱码与问号)
 │   ├── templates/                    # CAD 视图默认空白初始化模板
-│   └── samples/                      # 内置真实测试图纸 (baseline-sample.dwg, canteen.dwg)
+│   └── samples/                      # 内置示例图纸 (canteen.dwg)
 └── src/                              # 【核心源码层】
     ├── main.tsx                      # React 挂载入口
     ├── index.css                     # Tailwind 全局基础样式
@@ -109,3 +109,64 @@ npm install @mlightcad/cad-simple-viewer@^1.7.6 \
 - **`@mlightcad/data-model`**：CAD 内存数据库模型（提供 `AcDbDatabase`、图层表、块表、布局管理器及各类二维/三维图元数据结构）。
 - **`@mlightcad/three-renderer` & `three`**：基于 Three.js WebGL 的 CAD 二维正交相机渲染器，负责将海量 CAD 线段、圆弧、文字合并批次（Batching）交由 GPU 高帧率绘制。
 - **`@mlightcad/cad-simple-viewer`**：顶层文档与视口控制器（`AcApDocManager`），管理画布生命周期、鼠标滚轮缩放、拖拽平移与智能聚簇居中。
+
+---
+
+## 四、50MB+ 超大 DWG 防卡死与防移动端 OOM 崩溃核心保障机制
+
+针对 50MB~70MB+ 巨型图纸（如 66MB 工程图平图、52MB 总平图，包含 10 万 ~ 20 万+ 图元）在浏览器中的加载稳定性，系统实施了四大防御机制：
+
+### 1. 协作式让出 (`cooperativeYield: true`) 与动态自适应分片 (`calculateAdaptiveChunkSize`)
+- **致命痛点**：若关闭协作式让出（`cooperativeYield: false`）或硬编码大 Chunk（如 5000），SDK 将在单个 JS 同步宏任务中跑满 30~50 秒，完全独占浏览器主线程，触发桌面端 Chrome 报“页面无响应”；同时阻断了 V8 引擎增量垃圾回收（GC），手机端瞬间突破 1.5GB 内存上限发生 OOM 闪退。
+- **防御策略**：
+  - 强制开启 `cooperativeYield: true` 与 `progressiveRendering: true`；
+  - 动态计算分片：巨型图纸（>=15MB 或 >=15,000 图元）使用 `minimumChunkSize: 200`，中型图纸使用 300，小型图纸使用 1000；
+  - 驱动底座每处理 200 个实体后主动调用 `accmYieldToUi()` 让出主线程，确保 60fps 心跳刷新和 V8 增量 GC 及时回收临时对象。
+
+### 2. 原生 C++ 数据流直解与零拷贝解压加速 (`decompressGzipToEnvelope`)
+- **致命痛点**：旧版采用 JavaScript 逐块拼接（`leftover += decoder.decode(...)`），在 300MB+ JSON 巨型流下引发经典 $O(N^2)$ 二次字符串复制灾难，累积产生 ~800GB 瞬时字符串垃圾，单解压一步就霸占主线程整整 71 秒！
+- **提速方案**：
+  - 采用浏览器原生 C++ `new Response(decompressedStream).text()` 直接管道直解，彻底剔除 5,000+ 次 JavaScript 微任务 Promise 轮询；
+  - 配合 NDJSON 索引切块与协作式让出（每 25 个块主动让出微任务），将 40MB Gzip（解压后 301MB JSON）解压耗时从 **71 秒骤降至 1.85 秒**（提速 38 倍）；
+  - 按钮文案由口语化的“秒开”全面规范命名为工程标准的**「快速载入」**与**「极速加载」**。
+
+
+### 3. WASM 解析与 Gzip 缓存持久化异步解耦
+- WASM 解码完成后，绝不在渲染前阻塞执行 Gzip 压缩（超大图纸压缩需 2~3 秒）；
+- 优先立即将 CAD 数据库交付 `openDocument()` 启动渲染，利用 `setTimeout` 将 Gzip 压缩生成与服务端/IndexedDB 同步转入空闲微任务后台执行。
+
+### 4. UI 进度条双分支流感知
+- 明确划分 **`[⚡ Gzip 极速秒开模式]`** 与 **`[⚙️ DWG ➜ JSON 全量分析模式]`**，节点与徽标清晰反馈当前执行管线。
+
+### 5. 样图库同名匹配优先法则 (Same-name Matching Rule)
+- 样图库下拉菜单及 `loadFromUrl` 统一接入同名匹配法则（`findGzipCacheByFileName`）；
+- 若 L1 (IndexedDB) 或 L2 (服务端共享池) 存在与选中 DWG 同名的 Gzip 缓存记录，下拉项即刻点亮 `⚡ Gzip` 徽标；
+- 点击后自动绕过数十兆的原始 DWG 网络下载与 WASM 二进制解码，直接调用 `loadFromCachedFingerprint` 瞬时载入图纸。
+
+### 6. iOS 与移动端内核级 Jetsam 防闪退机制（字节级流式直通与显存收敛）
+- **物理机制剖析**：
+  - iOS WebKit（Safari / 微信内置浏览器等）强制单网页 WebContent 进程常驻物理内存（RSS）不得超过 **1.0GB ~ 1.2GB**（由 iOS 内核级 Jetsam 机制强杀 `SIGKILL 9`，表现为点击大图后 1~2 秒内瞬间白屏且无任何 JS Console 报错）。
+  - 66MB DWG 解压后产生 316.2MB JSON（含中文字符）。若调用 `new Response(decompressedStream).text()`，WebKit 会在 C++ 层累积 316MB `SharedBuffer`，并在 JavaScriptCore 分配一个 **600MB+ 的 16-bit UTF-16 (`UChar`) 连续大字符串**，在 `text.split('\n')` 完成前瞬间突破 950MB+，叠加已有图纸内存直接触发 Jetsam 强杀。
+- **根治落地策略**：
+  1. **字节级换行符 (`0x0A`) 流式解码器 (`decompressGzipToEnvelope`)**：废除 `Response.text()` 一次性大字符串分配，直接从 `DecompressionStream` 的 `reader.read()` 读取 `Uint8Array` 分块，使用原生 `chunk.indexOf(10, startOffset)` 在字节流中切分 `\n`（`0x0A`），单块内整行通过 `subarray` 零拷贝切片，每次仅对单行（~1MB）执行 `TextDecoder.decode` 与反序列化，使解压阶段的字符串/缓冲瞬时峰值从 **950MB+ 降至 < 4MB**。
+  2. **网络流直通与移动端 IndexedDB 大包豁免 (`dwgLocalCacheStore.ts`)**：
+     - 移动端回退拉取服务端 L2 缓存时，直接将 `res.body` (`ReadableStream`) 管道直通传入 `decompressGzipToEnvelope`，免去 `await res.arrayBuffer()` 的 41MB 连续内存分配；
+     - 移动端禁止向 `memoryStore` 写入 `gzBytes`，且对 >10MB 的 `.gz` 跳过写入本地 IndexedDB（规避 WebKit Structured Clone 跨进程 IPC 翻倍拷贝），`listGzipCacheEntries` 改用 `openCursor()` 游标扫描并立即置空 `gzBytes`。
+  3. **切换大图前预清空旧场景 (`releasePreviousSceneBeforeLoad`)**：在加载新图纸前主动调用 `curView.abortConversion()` 与 `curView._scene.clear()` 并让出 25ms，先行释放上一张图纸占用的 ~200MB 内存与显存。
+  4. **WebGL Canvas 像素比上限收敛与 Resize 守护**：
+     - 移动端与防御模式下将 Three.js `pixelRatio` 锁定在 `1.25`（物理像素缩减 5.95 倍，4x MSAA 帧缓冲显存降低 83.2%），并在 `window` `resize` 时持续守护防止 iOS 地址栏收起重置 DPR。
+  5. **按 45ms 时间片协作式让出与 UI 双模开关**：
+     - 解压循环按真实时间片（每 45ms 让出 `8ms`）刷新 UI 进度，兼顾加载速度与主线程响应；顶部提供 `[🛡️ 防闪退模式]` 显式开关。
+
+### 7. 大地坐标与离散图元智能聚焦防御 (Statistical Cluster Framing)
+- **痛点现象**：
+  - 加载如 66MB `large-drawing.dwg` 等大地测量或市政工程图纸时，图纸被拉得极远，主体图层在视口左侧缩成一个极小的点。
+- **根因分析**：
+  1. **DWG 文件头脏数据**：AutoCAD 在头变量 `$EXTMAX` 中残留了 异常范围的包围盒，且图层 `"0"` 中存在离散孤点/异常图元；而真实图纸主体集中在一个小得多的范围内，两者相距数万公里。
+  2. **SDK `applyInitialZoom` 缺陷**：SDK 在图元转换完成时，优先无脑读取脏 `$EXTMAX` 并调用 `zoomTo(extents)`，将视口拉至几万公里高空覆盖全图。
+  3. **SDK `resolveSmartFitBox` 容差过大**：SDK 内部硬编码了 `1e10` (100亿) 的离散容差，无法剔除 6500 万级别的孤立图层。
+- **解决方案与实现**（[`src/core/dwgViewerEngine.ts`](src/core/dwgViewerEngine.ts#L1435-L1570)）：
+  1. **中位数统计聚簇 (Median Center & Span)**：提取所有非空图层包围盒，计算其几何中心与跨度的中位数；动态剔除偏离主体坐标系超限的极端异常图层（如成功剔除图层 `"0"`，保留其余 27 个主体图层）。
+  2. **Three-Renderer 契约盒**：构造具备内部写入属性的 `getSize` 与 `getCenter` Vector 包装盒，无缝驱动底层 `zoomTo(targetBox, 1.08)`。
+  3. **阻断 SDK 异步覆写**：注册 `markLayoutAsInitialized` 并向 `_externallyFramedLayouts` 登记当前布局，防止 SDK 内部定时器回弹重置视口。
+  4. **异步分批监听自适应**：在图元流式转换完全排空后自动补齐一次精细聚焦，实现开图即居中。

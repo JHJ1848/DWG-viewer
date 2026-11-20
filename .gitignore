@@ -14,8 +14,28 @@ coverage/
 
 # Local large test DWG files
 /*.dwg
-public/samples/*副本*
+/public/samples/*
+!/public/samples/canteen.dwg
+/.local/
+/.agents/
+/err.txt
+/out.txt
+*.jks
+*.keystore
 .cache/
 .playwright-cli/
 public/assets/aistudio/
+
+# Electron packaging & build artifacts
+/release/
+/dist-electron/
+
+# Android build & local artifacts
+.gradle/
+**/android/.gradle/
+**/android/build/
+**/android/app/build/
+**/android/captures/
+**/android/local.properties
+**/android/.idea/
 

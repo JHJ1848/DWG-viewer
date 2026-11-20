@@ -133,14 +133,87 @@ test('createDwgStubBuffer passes inspectDwgHeader and embeds recoverable token e
 
 test('normalizeDwgFileNameForConverter and isGzipCacheFile handle .dwg.cache.gz extensions accurately', () => {
   assert.equal(isGzipCacheFile('canteen.dwg.cache.gz'), true);
-  assert.equal(isGzipCacheFile('baseline-sample.dwg.v2.cache.gz'), true);
+  assert.equal(isGzipCacheFile('canteen.dwg.v2.cache.gz'), true);
   assert.equal(isGzipCacheFile('canteen.dwg'), false);
 
   assert.equal(normalizeDwgFileNameForConverter('canteen.dwg.cache.gz'), 'canteen.dwg');
-  assert.equal(normalizeDwgFileNameForConverter('baseline-sample.dwg.v2.cache.gz'), 'baseline-sample.dwg');
+  assert.equal(normalizeDwgFileNameForConverter('canteen.dwg.v2.cache.gz'), 'canteen.dwg');
   assert.equal(normalizeDwgFileNameForConverter('site-plan.cache.gz'), 'site-plan.dwg');
   assert.equal(normalizeDwgFileNameForConverter('canteen.dwg'), 'canteen.dwg');
 
   assert.equal(buildGzipCacheFileName('canteen.dwg'), 'canteen.dwg.cache.gz');
   assert.equal(buildGzipCacheFileName('canteen.dwg.cache.gz'), 'canteen.dwg.cache.gz');
+});
+
+test('decompressGzipToEnvelope supports ReadableStream<Uint8Array> and byte-level 0x0A NDJSON streaming across fragmented UTF-8 chunks', async () => {
+  const msEntities = Array.from({ length: 4200 }, (_, i) => ({
+    type: 'MTEXT',
+    layer: '01-中文地形图高程注记层',
+    text: `样例工程区测绘控制点_${i}_高程2850.5m`,
+    handle: BigInt(100000 + i),
+    insertionPoint: { x: 32600000 + i, y: 3100000 + i, z: 0 },
+  }));
+  const btrEntities = Array.from({ length: 600 }, (_, i) => ({
+    type: 'LINE',
+    layer: '02-建筑物轮廓线',
+    handle: BigInt(500000 + i),
+    startPoint: { x: i, y: i },
+    endPoint: { x: i + 10, y: i + 10 },
+  }));
+
+  const envelope: DwgCacheEnvelope = {
+    __dwgCacheSchema: DWG_CACHE_SCHEMA_VERSION,
+    fileName: '示例图纸一.dwg',
+    fingerprint: 'dwg_v2_69334172_test',
+    originalByteLength: 69334172,
+    versionLabel: 'AutoCAD 2018 DWG',
+    createdAt: 1710000000000,
+    wasmParseMs: 12000,
+    entityCount: msEntities.length + btrEntities.length,
+    layerCount: 2,
+    payload: {
+      model: {
+        header: { EXTMIN: { x: 0, y: 0, z: 0 } },
+        tables: {
+          LAYER: { entries: [{ name: '01-中文地形图高程注记层' }, { name: '02-建筑物轮廓线' }] },
+          BLOCK_RECORD: {
+            entries: [{ name: '*MODEL_SPACE', entities: btrEntities }],
+          },
+        },
+        entities: msEntities,
+      },
+    },
+  };
+
+  const compressed = await compressEnvelopeToGzip(envelope);
+  assert.equal(isGzipMagicHeader(compressed.gzBytes), true);
+
+  // Create a fragmented ReadableStream that yields tiny 97-byte slices to stress-test cross-chunk UTF-8 and 0x0A boundary handling
+  let offset = 0;
+  const step = 97;
+  const fragmentedStream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= compressed.gzBytes.byteLength) {
+        controller.close();
+        return;
+      }
+      const slice = compressed.gzBytes.subarray(
+        offset,
+        Math.min(compressed.gzBytes.byteLength, offset + step)
+      );
+      offset += step;
+      controller.enqueue(slice);
+    },
+  });
+
+  const restored = await decompressGzipToEnvelope(fragmentedStream);
+  assert.equal(restored.fileName, '示例图纸一.dwg');
+  assert.equal(restored.__rawJsonBytes, compressed.rawJsonBytes);
+  assert.equal(restored.payload.model.entities.length, 4200);
+  assert.equal(restored.payload.model.tables.BLOCK_RECORD.entries[0].entities.length, 600);
+  assert.equal(
+    restored.payload.model.entities[4199].text,
+    '样例工程区测绘控制点_4199_高程2850.5m'
+  );
+  assert.equal(restored.payload.model.entities[4199].handle, BigInt(104199));
 });

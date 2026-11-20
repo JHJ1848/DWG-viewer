@@ -64,7 +64,6 @@ export function validateDwgOrCacheFileName(fileName: string): DwgValidationResul
   };
 }
 
-
 /**
  * Reads the first 6 bytes of a DWG binary buffer to identify its AutoCAD version signature.
  */
@@ -109,7 +108,7 @@ export function formatByteSize(bytes: number): string {
 }
 
 /**
- * Extracts a clean .dwg file name from a MinIO presigned URL, Spring proxy URL, or relative path.
+ * Extracts a clean .dwg file name from a MinIO S3 URL, `/api/minio/stream` URL, or relative path.
  */
 export function extractFileNameFromUrl(rawUrl: string): string {
   const trimmed = (rawUrl || '').trim();
@@ -117,21 +116,23 @@ export function extractFileNameFromUrl(rawUrl: string): string {
   try {
     const parsed = new URL(trimmed, 'http://localhost');
 
-    // 1. If URL has a 'path' query parameter (e.g. /api/minio/get_file?path=nonglintu/dwg/test.dwg)
-    const queryPath = parsed.searchParams.get('path');
-    if (queryPath) {
-      const decodedQuery = decodeURIComponent(queryPath);
-      const segments = decodedQuery.split('/').filter(Boolean);
+    // 1. If URL has a 'name' or 'path' query parameter (e.g. /api/workspace/file?name=test.dwg or /api/minio/stream?path=drawings/dwg/test.dwg)
+    const queryName = parsed.searchParams.get('name') || parsed.searchParams.get('path');
+    if (queryName) {
+      const decodedQuery = decodeURIComponent(queryName);
+      const segments = decodedQuery.split(/[\\/]/).filter(Boolean);
       const last = segments[segments.length - 1];
       if (last) {
-        return last.toLowerCase().endsWith('.dwg') ? last : `${last}.dwg`;
+        return last.toLowerCase().endsWith('.dwg') || last.toLowerCase().endsWith('.gz')
+          ? last
+          : `${last}.dwg`;
       }
     }
 
     // 2. Fallback to pathname segments
     const segments = parsed.pathname.split('/').filter(Boolean);
     const lastSegment = segments.length > 0 ? decodeURIComponent(segments[segments.length - 1]) : '';
-    if (lastSegment && lastSegment !== 'get_file') {
+    if (lastSegment && lastSegment !== 'stream') {
       return lastSegment.toLowerCase().endsWith('.dwg') ? lastSegment : `${lastSegment}.dwg`;
     }
   } catch {
@@ -145,14 +146,11 @@ export function extractFileNameFromUrl(rawUrl: string): string {
   return 'remote.dwg';
 }
 
-export const DEFAULT_MINIO_API_BASE =
-  typeof window !== 'undefined' && window.location && window.location.origin
-    ? ''
-    : 'http://192.168.81.163:9008';
+export const DEFAULT_MINIO_API_BASE = '';
 
 /**
- * Normalizes user input (MinIO console URL, relative object path, or direct proxy URL)
- * into a standardized Spring Boot MinIO proxy URL.
+ * Normalizes user input (MinIO Console URL, S3 object URL, relative object path, or `/api/minio/stream` URL)
+ * into a standardized `/api/minio/stream?path=...` streaming URL.
  * Automatically handles mobile input anomalies: full-width slashes (／), surrounding quotes, and missing .dwg extension.
  */
 export function resolveMinioDwgUrl(
@@ -173,43 +171,53 @@ export function resolveMinioDwgUrl(
     return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
   }
 
-  // 4. Auto-append .dwg extension if missing for relative paths (e.g. nonglintu/dwg/1如意乡平图1 -> .dwg)
+  // 4. Already a local `/api/minio/stream` or `/api/workspace/file` URL: return as-is
+  if (trimmed.includes('/api/minio/stream') || trimmed.includes('/api/workspace/file')) {
+    return trimmed;
+  }
+
+  // 5. Auto-append .dwg extension if missing for relative paths (e.g. drawings/dwg/示例图纸一 -> .dwg)
   if (
     trimmed.includes('/') &&
     !trimmed.startsWith('http://') &&
     !trimmed.startsWith('https://') &&
     !trimmed.toLowerCase().endsWith('.dwg') &&
+    !trimmed.toLowerCase().endsWith('.gz') &&
     !trimmed.includes('?')
   ) {
     trimmed = `${trimmed}.dwg`;
   }
 
-  // 5. MinIO Console URL: :9090/browser/:bucket/:encodedObjectKey
+  const base = apiBaseUrl || '';
+
+  // 6. MinIO Console URL: :9090/browser/:bucket/:encodedObjectKey
   const consoleMatch = trimmed.match(/(?:https?:\/\/[^/]+(?::\d+)?)?\/browser\/([^/]+)\/(.+)$/);
   if (consoleMatch) {
     const bucket = consoleMatch[1];
     const objectKey = decodeURIComponent(consoleMatch[2]);
     const fullPath = `${bucket}/${objectKey}`;
-    const base = apiBaseUrl || '';
-    return `${base}/api/minio/get_file?path=${encodeURIComponent(fullPath)}&preview=true&inline=true`;
+    return `${base}/api/minio/stream?path=${encodeURIComponent(fullPath)}`;
   }
 
-  // 6. Already full proxy URL: replace legacy /api/feqi/minio/get_file if present
-  if (trimmed.includes('/minio/get_file')) {
-    let normalized = trimmed.replace('/api/feqi/minio/get_file', '/api/minio/get_file');
-    if (!normalized.includes('preview=')) {
-      normalized += `${normalized.includes('?') ? '&' : '?'}preview=true&inline=true`;
+  // 7. Direct MinIO S3 URL (e.g. http://storage.example.invalid:9000/drawings/dwg/01.dwg or any custom http(s)://host:port/bucket/key.dwg)
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    // Preserve presigned S3 URLs directly
+    if (trimmed.includes('X-Amz-Signature=')) {
+      return trimmed;
     }
-    return normalized;
+    try {
+      const parsed = new URL(trimmed);
+      const cleanPath = decodeURIComponent(parsed.pathname).replace(/^\/+/, '');
+      if (cleanPath && cleanPath.includes('/')) {
+        return `${base}/api/minio/stream?path=${encodeURIComponent(cleanPath)}`;
+      }
+    } catch {
+      // Fallback to returning original URL
+    }
+    return trimmed;
   }
 
-  // 7. MinIO relative object path: e.g. nonglintu/dwg/1如意乡平图1.dwg
-  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-    const cleanPath = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
-    const base = apiBaseUrl || '';
-    return `${base}/api/minio/get_file?path=${encodeURIComponent(cleanPath)}&preview=true&inline=true`;
-  }
-
-  return trimmed;
+  // 8. MinIO relative object path: e.g. drawings/dwg/示例总平面图.dwg or dwg/01.dwg
+  const cleanPath = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
+  return `${base}/api/minio/stream?path=${encodeURIComponent(cleanPath)}`;
 }
-

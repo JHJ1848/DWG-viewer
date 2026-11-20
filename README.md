@@ -1,4 +1,48 @@
-# CADLight DWG 预览核心 — 技术路线、项目结构与交接迁移文档
+# DWG-viewer 工程图纸预览工作台 — 技术路线、项目结构与交接迁移文档
+
+## 快速上手与开发指南
+
+### 1. 环境准备与系统条件
+- **Node.js**: 推荐 `v18.x` 或 `v20.x` LTS（全平台通用）；
+- **包管理器**: `npm`（建议随 Node 自带版本，或使用 `pnpm` / `bun`）；
+- **操作系统环境条件**:
+  - **Web 端与核心服务**: 支持 Windows 10/11、macOS、Linux 全平台；
+  - **Windows 桌面端 (Electron)**: 调试与打包需在 Windows 操作系统环境下执行。
+
+### 2. 初始化与安装命令
+```bash
+# 1. 解压后进入项目根目录
+cd DWG-viewer
+
+# 2. 安装全部项目依赖（会自动触发 postinstall 钩子执行 OLE 高清光栅化补丁）
+npm install
+
+# 3. 编译生产后端服务脚本 (输出 electron/server.cjs)
+npm run build:server
+
+# 4. 前端工程构建验证 (输出 dist 静态资源)
+npm run build
+```
+
+### 3. 常用运行与发版命令
+```bash
+# Web 端全功能开发调试（支持本地 3000 端口同源服务）：
+npm run dev
+
+# 单元测试（19 项用例自测）：
+npm test
+
+# Windows 桌面端调试（需 Windows 环境）：
+npm run electron:dev
+
+# Windows 桌面端发版打包（输出 NSIS 安装包到 release/<版本号>/，需 Windows 环境）：
+npm run electron:build
+
+# 若 Windows 资源编辑器 rcedit 报错，可在前两项构建成功后生成未签名安装包：
+# npx electron-builder --win "-c.win.signAndEditExecutable=false" --publish never
+```
+
+---
 
 本项目已按**第一性原理**完成精简与解耦，剥离了所有与核心预览无关的外围组件，仅保留 **DWG 读取（MinIO/URL 远程拉取 + 本地上传）+ LibreDWG WASM 异步解析 + Three.js WebGL 2D 视图交互（滚轮缩放、拖拽平移、智能居中复位）**，并将核心能力封装为与前端框架无关的纯 TypeScript 引擎类 `DwgViewerEngine`。
 
@@ -53,7 +97,7 @@
 │   │   └── mtext-renderer-worker.js  # MTEXT 多行文本与 SHX 矢量字体几何排版 Worker
 │   ├── fonts/                        # CAD 矢量字体库 (.shx / 中文字体，解决中文乱码与问号)
 │   ├── templates/                    # CAD 视图默认空白初始化模板
-│   └── samples/                      # 内置真实测试图纸 (baseline-sample.dwg, canteen.dwg)
+│   └── samples/                      # 内置示例图纸 (canteen.dwg)
 └── src/                              # 【核心源码层】
     ├── main.tsx                      # React 挂载入口
     ├── index.css                     # Tailwind 全局基础样式

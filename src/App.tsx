@@ -1407,10 +1407,10 @@ export default function App() {
       {/* 顶部导航栏：单行固定比例弹性缩放（绝对杜绝 flex-wrap 换行），三大板块各司其职 */}
       {/* [03_ui_design] 强制 flex-nowrap 单行锁定，右侧配置区永久靠右（ml-auto shrink-0），文字小屏退避为精致图标 */}
       <header className="app-toolbar relative z-40 bg-[#1b1b1d] border-b border-white/[0.08] w-full flex items-center justify-between gap-1.5 sm:gap-2 flex-nowrap overflow-x-auto no-scrollbar h-[48px] sm:h-[52px] px-safe pt-safe px-2 sm:px-4 shrink-0">
-        {/* === 1. 展示组 (Brand & Status)：品牌 Logo + 图纸状态 + 性能状态 (左侧锁定，最大 28%，文件名 truncate) === */}
+        {/* === 1. 展示组 (Brand & Status)：品牌 Logo + 图纸状态 + 性能状态 (按内容占宽，长文件名省略) === */}
         <div
           data-section="display"
-          className="bg-[#19191b] border border-white/[0.06] p-1 rounded-xl flex items-center gap-1 sm:gap-1.5 shrink-0 max-w-[28%] min-w-0 flex-nowrap"
+          className="bg-[#19191b] border border-white/[0.06] p-1 rounded-xl flex items-center gap-1 sm:gap-1.5 shrink-0 max-w-full min-w-0 flex-nowrap"
         >
           {/* 产品首页入口 */}
           <button
@@ -1440,9 +1440,9 @@ export default function App() {
               <IconButton label={t("当前图纸")} onClick={() => resumeDetail()}><ArrowUpRight /></IconButton>
 
           {/* 图纸文件名与大小 Badge */}
-          <div className="flex items-center gap-1.5 min-w-0 max-w-[120px] xs:max-w-[160px] sm:max-w-[200px] md:max-w-[240px] shrink">
+          <div className="flex items-center gap-1.5 min-w-0 shrink">
             <span
-              className="value-tag truncate"
+              className="value-tag toolbar-filename truncate"
               title={loadedMeta.fileName}
             >
               {loadedMeta.fileName}

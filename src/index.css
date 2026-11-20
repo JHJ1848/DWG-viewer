@@ -169,7 +169,7 @@
   gap: 4px;
 }
 .app-toolbar [data-section] { background: transparent; border: 0; padding: 0; gap: 2px; }
-.app-toolbar [data-section="display"] { max-width: min(28%, 300px); }
+.app-toolbar .toolbar-filename { display: block; max-width: clamp(14ch, 24vw, 38ch); }
 .app-toolbar button[title]:not(.source-menu button) {
   justify-content: center; min-width: 36px; min-height: 36px; border-color: transparent; background-color: transparent;
 }

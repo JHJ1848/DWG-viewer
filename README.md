@@ -1,4 +1,41 @@
-# DWG-viewer 工程图纸预览工作台 — 技术路线、项目结构与交接迁移文档
+# DWG-viewer
+
+## 项目设计初衷
+
+我们想做一款免费的开源 DWG 演示软件，让工程师和项目团队在会议、现场沟通或内部业务系统中，直接打开图纸、定位细节、讲解方案。Windows 用户可以安装桌面版，开发团队也可以把同一套预览能力移植到自己的 Web 系统。
+
+选择 Web 技术的好处是，**图纸解码和画布渲染可以独立于业务系统复用**。工作区、MinIO 或本地文件提供 DWG 字节；Web Worker 调用 LibreDWG WebAssembly 解码，整理二维图元；MLightCAD 与 Three.js 将几何和文字绘制到 WebGL 画布。Electron 为这套前端补上本机文件选择、菜单和资源监控。内部系统可以保留自己的登录、文件权限和存储服务，把授权后的文件交给预览引擎；下文给出 Vue 组件与 iframe 两种接入方式。
+
+当前仓库公开源码，尚未声明项目级许可证。私有系统复用或再分发前，请确认项目授权及所用依赖的许可条件。
+
+[下载 Windows x64 安装包](https://github.com/JHJ1848/DWG-viewer/releases/latest) · [查看演示图纸](public/samples/canteen.dwg)
+
+## 功能与优化
+
+| 场景 | 使用方式与实现 |
+| --- | --- |
+| 打开图纸 | 切换工作区目录、浏览 MinIO 对象，或选择和拖入本地 DWG、压缩缓存文件。桌面版提供原生目录选择，MinIO 可配置端点和存储桶。 |
+| 演示与导航 | 在画布上缩放、平移、框选、适配视图。返回工作台再进入详情可保留当前图纸与视角；选择另一张图纸时切换活动文档。工作区与 MinIO 路由支持复制链接，接收端需有对应文件和访问权限。 |
+| 首次打开大图 | Worker 承担解码，视口按批构建实体，进度面板展示当前阶段与耗时。内存优化模式限制渲染分辨率并调整分批策略，降低峰值占用，加载耗时可能增加。 |
+| 再次打开 | IndexedDB 与服务端磁盘保存 Gzip 预览缓存。命中时走流式解压路径，减少重复 DWG 解码。缓存面板支持载入、下载缓存包、重新解析及清理。 |
+| 工程图显示 | 二维预处理修正闭合多段线与部分等高线；聚簇取景减轻远处孤立图元对初始视图的影响。字体资源、富文本排版及 OLE 栅格化改善文字与嵌入表格的可读性。 |
+| 桌面使用与诊断 | 中英文菜单和主要组件、GPU / WebGL 信息、应用进程 CPU 与内存趋势。Windows 版从 3000 起选择可用端口，同机浏览器可访问桌面服务。 |
+
+![DWG 预览的文件来源、首次解码和缓存命中路径](docs/product/preview-pipeline.svg)
+
+## 实际效果
+
+**二维画布** · 内置 canteen.dwg 同时展示建筑立面、平面、轴线标注和表格。
+
+![canteen.dwg 在桌面端的二维预览](docs/product/preview-04.png)
+
+| 图纸工作台 | 工作区设置 |
+| --- | --- |
+| ![工作区、MinIO 与本地缓存列表](docs/product/preview-01.png) | ![选择历史目录或设置自定义图纸目录](docs/product/preview-02.png) |
+
+**加载过程** · 示例截取了缓存解压完成、正在构建图元的阶段。截图中的耗时和资源占用来自当次运行。
+
+![加载阶段、当前进度和资源占用](docs/product/preview-03.png)
 
 ## 快速上手与开发指南
 
@@ -41,10 +78,6 @@ npm run electron:build
 # 若 Windows 资源编辑器 rcedit 报错，可在前两项构建成功后生成未签名安装包：
 # npx electron-builder --win "-c.win.signAndEditExecutable=false" --publish never
 ```
-
----
-
-本项目已按**第一性原理**完成精简与解耦，剥离了所有与核心预览无关的外围组件，仅保留 **DWG 读取（MinIO/URL 远程拉取 + 本地上传）+ LibreDWG WASM 异步解析 + Three.js WebGL 2D 视图交互（滚轮缩放、拖拽平移、智能居中复位）**，并将核心能力封装为与前端框架无关的纯 TypeScript 引擎类 `DwgViewerEngine`。
 
 ---
 
@@ -340,12 +373,12 @@ watch(
 4. **`LWPOLYLINE` 闭合位兼容（`512` -> `1`）**：
    - **处理**：将 LibreDWG 的 `flag & 512` 同步置位到 `flag |= 1`，确保闭合网格与闭合多段线不丢最后一段闭合边。
 
-### 已落地的双层 Gzip 缓存引擎（L1 浏览器 IndexedDB + L2 服务端多设备共享）
+### 已落地的双层 Gzip 缓存引擎（L1 浏览器 IndexedDB + L2 服务端磁盘）
 1. **DWG 指纹计算 (`computeDwgFingerprint`)**：对 DWG 二进制流采样（头 64KB + 中部 64KB + 尾 64KB + 文件字节长度）计算 FNV-1a 64-bit 指纹（如 `dwg-v1-a8d08bf36d57fb06-226576`），耗时 `< 1ms`。
 2. **DWG 中间 JSON 瘦身 (`stripDwgDatabaseForCache`)**：自动剔除 `@mlightcad/libredwg-web` 在顶层 `db.entities` 与 `BLOCK_RECORD.entities` 之间重复生成的冗余模型空间实体引用及无用 `xdata`，在零损画质前提下将序列化 JSON 体积缩减约 `45%`~`55%`。
 3. **双层 Gzip 缓存读写 (`src/utils/dwgGzipCache.ts` + `src/utils/dwgLocalCacheStore.ts` + `server.ts`)**：
    - **L1 浏览器本地缓存**：基于 Web 原生 `CompressionStream('gzip')` / `DecompressionStream('gzip')` 与 `IndexedDB`，单机二次打开跳过 `libredwg-web.wasm` 二进制解码。
-   - **L2 服务端共享缓存 (`/api/dwg-cache/:fingerprint`)**：服务端将 `.dwg.json.gz` 与 `.meta.json` 持久化在 `.cache/dwg-gzip/` 目录（后续可无缝替换为 Spring Boot + MinIO 对象存储），一人首次解析后，局域网或多设备首次打开同一图纸即可直接拉取 L2 Gzip 缓存并回填本地 L1 IndexedDB，实现跨设备秒开。
+   - **L2 服务端共享缓存 (`/api/dwg-cache/:fingerprint`)**：服务端将 `.dwg.json.gz` 与 `.meta.json` 持久化在 `.cache/dwg-gzip/` 目录，桌面生产环境使用用户目录下的缓存。再次打开时可读取 L2 并回填本地 L1，减少重复解析。
 
 ### 后续待办清单 (TODO)
 

@@ -1217,7 +1217,12 @@ export default function App() {
       void executeRouteState(nextRoute, false);
     };
 
+    const parentOrigins = new Set([
+      window.location.origin,
+      ...(import.meta.env.VITE_EMBED_PARENT_ORIGINS || '').split(',').map((origin: string) => origin.trim()).filter(Boolean),
+    ]);
     const onWindowMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent || !parentOrigins.has(event.origin)) return;
       const payload = event.data;
       if (!payload || typeof payload !== 'object') return;
       if (payload.type === 'LOAD_DWG_URL' && typeof payload.url === 'string') {
@@ -1269,6 +1274,11 @@ export default function App() {
 
     window.addEventListener('popstate', onPopState);
     window.addEventListener('message', onWindowMessage);
+    if (window.parent !== window) {
+      for (const origin of parentOrigins) {
+        if (/^https?:\/\//.test(origin)) window.parent.postMessage({ type: 'DWG_VIEWER_READY' }, origin);
+      }
+    }
     return () => {
       window.removeEventListener('popstate', onPopState);
       window.removeEventListener('message', onWindowMessage);

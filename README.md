@@ -40,7 +40,7 @@
 ## 快速上手与开发指南
 
 ### 1. 环境准备与系统条件
-- **Node.js**: 推荐 `v18.x` 或 `v20.x` LTS（全平台通用）；
+- **Node.js**: 本项目用 Node.js 24 构建；请同时满足锁定版本 Vite 的 engines 要求；
 - **包管理器**: `npm`（建议随 Node 自带版本，或使用 `pnpm` / `bun`）；
 - **操作系统环境条件**:
   - **Web 端与核心服务**: 支持 Windows 10/11、macOS、Linux 全平台；
@@ -153,9 +153,9 @@ npm run electron:build
 | 文件路径 | 角色定位 | 具体职责分工 |
 | :--- | :--- | :--- |
 | **`src/core/dwgViewerEngine.ts`** | **无框架依赖的核心引擎类**（迁移核心） | 1. **`mount(container)`**：在传入的任意 DOM 容器上初始化 `@mlightcad/cad-simple-viewer` 单例（关闭冗余命令行/编辑工具栏，绑定 WASM Worker 与字体路径）。<br>2. **`loadFromUrl(url, options)`**：通过 `fetch` 拉取 MinIO 预签名地址或带 `Authorization` Header 的 Spring Boot 文件流，转为 `ArrayBuffer` 后交由解析管线渲染。<br>3. **`loadFromBuffer(fileName, buffer)`**：校验文件头后调用 `docManager.openDocument` 异步解码并渲染图纸。<br>4. **`ensureModelSpaceActive()`**：自动识别“保存在空白布局页（Paper Space）的总平图”，自动切换回包含完整图元的模型空间（Model Space）。<br>5. **`fitToView()`**：调用智能聚簇包围盒算法（`zoomToSmartExtents`），自动排除测绘图中远离主图的 `(0,0)` 原点飞点并居中展示。 |
-| **`src/workers/libredwgParserWorker.ts`** | **后台解码与数据归一化 Worker**（迁移核心） | 1. 运行在独立 Web Worker 线程，加载 `/wasm/libredwg-web.wasm` 解码 DWG 原始字节流，避免大文件（50~100MB）阻塞浏览器主线程。<br>2. 调用 `instance.convertEx(dwg)` 生成纯 JSON 结构的 `result.database`（**这也是后续做中间数据持久化缓存的切入点**）。<br>3. **`normalizeDwgDatabaseFor2DPreview()`**：针对二维工程预览进行数据修正：<br>　• 将所有图层 `plotFlag` 置为 `1`，解决 CAD 中设为“不打印”的坐标网格线、辅助轴线被默认隐藏的问题；<br>　• 将所有图元与块内顶点的 `elevation` / `z` 坐标统一拍平至 `0`，解决带真实海拔（如 `Z > 500m`）的测绘等高线超出正交相机远裁剪面（`far=1000`）被整条裁切的问题；<br>　• 修正 `LWPOLYLINE` 闭合标志位（`512 -> 1`）与 `POLYLINE2D` 样条控制点过滤问题。 |
+| **`src/workers/libredwgParserWorker.ts`** | **后台解码与数据归一化 Worker**（迁移核心） | 1. 运行在独立 Web Worker 线程，加载 `/wasm/libredwg-web.wasm` 解码 DWG 原始字节流，避免大文件（50~100MB）阻塞浏览器主线程。<br>2. 调用 `instance.convertEx(dwg)` 生成纯 JSON 结构的 `result.database`（**这也是后续做中间数据持久化缓存的切入点**）。<br>3. **`normalizeDwgDatabaseFor2DPreview()`**：针对二维工程预览进行数据修正：<br>　• 将所有图层 `plotFlag` 置为 `1`，解决 CAD 中设为“不打印”的坐标网格线、辅助轴线被默认隐藏的问题；<br>　• 将支持的二维图元与块内顶点的 `elevation` / `z` 坐标统一拍平至 `0`，解决带真实海拔（如 `Z > 500m`）的测绘等高线超出正交相机远裁剪面（`far=1000`）被整条裁切的问题；<br>　• 修正 `LWPOLYLINE` 闭合标志位（`512 -> 1`）与 `POLYLINE2D` 样条控制点过滤问题。 |
 | **`src/utils/dwgValidation.ts`** | **二进制校验与 URL 工具**（迁移核心） | 1. **`inspectDwgHeader(buffer)`**：读取文件前 6 个字节签名（如 `AC1015`、`AC1027`、`AC1032`），校验是否为真实 AutoCAD DWG 二进制流并识别版本。<br>2. **`extractFileNameFromUrl(url)`**：从带签名参数的 MinIO 预签名 URL 或 Spring 下载地址中提取干净的 `.dwg` 文件名。<br>3. **`validateDwgFileName()` / `formatByteSize()`**：后缀校验与文件体积格式化。 |
-| **`src/App.tsx`** | **极简预览界面壳** | 1. 提供顶部操作栏：MinIO / 内部 URL 输入框、**「加载地址」**按钮、**「居中复位」**按钮、**「上传 DWG」**按钮。<br>2. 支持解析浏览器地址栏 `?url=` / `?minioUrl=` 参数自动加载远程图纸。<br>3. 监听 `window.addEventListener('message')`，支持作为 `<iframe>` 嵌入现有系统时接收父页面发来的 `LOAD_DWG_URL` 或 `LOAD_DWG_BUFFER` 指令。 |
+| **`src/App.tsx`** | **工作台与预览界面** | 提供工作区、MinIO 和本地文件入口，管理单图视口、路由、缓存面板及经过来源检查的 iframe 消息。 |
 
 ### 2. 静态资源目录 (`public/`)
 
@@ -179,182 +179,83 @@ npm run electron:build
 
 ## 四、迁移至现有 Web 系统 (Vue + Spring Boot + MinIO) 指南
 
-### 1. 安装核心依赖
+### 选择接入边界
 
-在现有的 Vue (Vite) 项目中安装以下核心包：
+宿主系统负责登录、文件授权和版本选择。让已有的业务下载接口返回 DWG 原始字节；收到 401、403 或其他错误时，先在宿主处理。预签名对象地址需要允许宿主来源的 CORS。只在宿主的受信任业务请求中使用登录凭据。
 
-```bash
-npm install @mlightcad/cad-simple-viewer@^1.7.6 \
-            @mlightcad/data-model@^1.15.11 \
-            @mlightcad/libredwg-converter@^3.15.11 \
-            @mlightcad/libredwg-web@^0.8.1 \
-            @mlightcad/three-renderer@^1.7.6 \
-            @mlightcad/mtext-parser@^1.5.5 \
-            @mlightcad/mtext-renderer@^0.13.5 \
-            @velipso/polybool@^2.0.11 \
-            lodash-es@^4.18.1 \
-            three@^0.186.1
+两种方式均可预览字节形式的图纸。完整工作台里的目录扫描、MinIO 代理和磁盘缓存另需对应后端；Electron 文件对话框和进程指标属于桌面功能。默认桌面服务只监听本机。私有系统若提供共享缓存，必须将缓存读写、列举和删除纳入自己的用户及文件权限范围；浏览器 IndexedDB 也会保留本来源的缓存。受限文档应先明确终端留存与退出清理策略。
+
+### A · 在 Vue 3 / Vite 中挂载一个视口
+
+可用组件见 [DwgViewport.vue](examples/vue/DwgViewport.vue)。将它放到宿主的 `src/dwg/`，并在同一目录保留下列相对结构。版本与本仓库的 package-lock.json 对齐，宿主继续使用自己的 Vue Vite 插件。引擎使用 Vite 的 Worker URL 导入。
+
+```text
+src/dwg/
+  DwgViewport.vue
+  core/dwgViewerEngine.ts
+  workers/libredwgParserWorker.ts
+  utils/deviceProfile.ts
+  utils/dwgGzipCache.ts
+  utils/dwgLocalCacheStore.ts
+  utils/dwgValidation.ts
+  utils/webglCompatibility.ts
 ```
 
-### 2. 拷贝静态资源与核心源码
+复制本仓库 package.json 中的 `@mlightcad/*`、`@velipso/polybool`、`lodash-es` 和 `three` 依赖，保留现有字体、OLE 渲染补丁所需的构建步骤。将 `public/wasm`、`public/workers`、`public/fonts`、`public/templates` 放到**宿主来源根目录**的同名 URL。宿主页面可位于子路径，但单改 Vite 的 base 无法改变引擎内部的根资源路径。与已有资源冲突时优先选方式 B。
 
-1. 将本项目的 `public/wasm`、`public/workers`、`public/fonts`、`public/templates` 四个目录原样复制到 Vue 项目的 `public/` 目录下。
-2. 将以下 3 个源码文件复制到 Vue 项目的 `src/` 对应目录中：
-   - `src/core/dwgViewerEngine.ts`
-   - `src/workers/libredwgParserWorker.ts`
-   - `src/utils/dwgValidation.ts`
+在父组件中给 `<DwgViewport ref="viewport" />` 绑定模板引用，待挂载后在“打开图纸”操作中调用：
 
----
+```ts
+import { ref } from 'vue';
+import DwgViewport from './dwg/DwgViewport.vue';
 
-### 3. 接入方式 A：在 Vue 3 组件中直接调用 `DwgViewerEngine`（推荐）
+const viewport = ref<InstanceType<typeof DwgViewport> | null>(null);
 
-```vue
-<template>
-  <div class="dwg-viewer-wrapper">
-    <!-- 顶部极简控制栏 -->
-    <div class="toolbar">
-      <span>{{ fileName }} ({{ fileSize }})</span>
-      <button @click="handleFitView">居中复位</button>
-      <span v-if="loading" class="progress-info">
-        [节点 {{ currentStep }}/5] {{ stageTitle }} · {{ percent }}% (耗时 {{ elapsed }})
-      </span>
-      <span v-if="errorMsg" class="error">{{ errorMsg }}</span>
-    </div>
-
-    <!-- WebGL 渲染画布容器 -->
-    <div ref="viewportRef" class="viewport-canvas"></div>
-  </div>
-</template>
-
-<script setup lang="ts">
-import { ref, onMounted, watch } from 'vue';
-import { DwgViewerEngine } from '@/core/dwgViewerEngine';
-
-const props = defineProps<{
-  /** Spring Boot 返回的 MinIO 预签名地址或后端文件流接口地址 */
-  minioFileUrl: string;
-  /** 可选：若走 Spring Boot 鉴权文件流接口，可传入 JWT Token */
-  authToken?: string;
-}>();
-
-const viewportRef = ref<HTMLElement | null>(null);
-const loading = ref(false);
-const percent = ref(0);
-const currentStep = ref(1);
-const stageTitle = ref('');
-const elapsed = ref('0.0s');
-const fileName = ref('');
-const fileSize = ref('');
-const errorMsg = ref('');
-
-let engine: DwgViewerEngine | null = null;
-
-const loadDwg = async (url: string) => {
-  if (!engine || !url) return;
-  errorMsg.value = '';
-  await engine.loadFromUrl(url, {
-    headers: props.authToken
-      ? { Authorization: `Bearer ${props.authToken}` }
-      : undefined,
+async function openDrawing(id: string, fileName: string) {
+  const res = await fetch('/api/drawings/' + encodeURIComponent(id) + '/content', {
+    credentials: 'same-origin',
   });
-};
+  if (!res.ok) throw new Error('文件读取失败 ' + res.status);
+  if (!viewport.value) throw new Error('视口尚未挂载');
+  return await viewport.value.open(fileName, await res.arrayBuffer());
+}
+```
 
-const handleFitView = () => {
-  engine?.fitToView();
-};
+这里的文件接口由宿主提供，返回原始 DWG。复用一个常驻视口（切页可用 v-show）；当前 CAD 文档管理器使用单例，多个并行实例或反复销毁、重建画布需单独适配。
 
-onMounted(() => {
-  if (!viewportRef.value) return;
+### B · 通过 iframe 复用已构建的工作台
 
-  engine = new DwgViewerEngine({
-    onProgress: (state) => {
-      loading.value = state.isLoading;
-      percent.value = state.percent;
-      currentStep.value = state.currentStep;
-      stageTitle.value = state.stageTitle;
-      elapsed.value = state.elapsedSeconds;
-    },
-    onLoaded: (meta) => {
-      fileName.value = meta.fileName;
-      fileSize.value = meta.fileSizeLabel;
-    },
-    onError: (msg) => {
-      errorMsg.value = msg;
-    },
-  });
+将 `npm run build` 生成的整个 dist 部署在预览站点的**来源根路径**。同源父页面默认可用。跨来源嵌入时，在预览端构建前设置 `VITE_EMBED_PARENT_ORIGINS`，值为允许的宿主 origin，多个以逗号分隔；修改后重新构建。该变量只声明允许的父页面来源。部署时让预览站点的 frame-ancestors 和宿主的 frame-src 允许相应来源。使用与此仓库版本相匹配的预览端，旧版没有就绪通知。
 
-  engine.mount(viewportRef.value);
+以下为宿主页面的原生 JS 示例。先注册监听，再创建 iframe。请替换站点与业务文件接口。业务鉴权在父页面完成，传给预览器的只有字节与文件名。
 
-  if (props.minioFileUrl) {
-    void loadDwg(props.minioFileUrl);
+```html
+<div id="drawing-host"></div>
+<script type="module">
+  const viewerOrigin = 'https://viewer.example.com';
+  const frame = document.createElement('iframe');
+  frame.title = '工程图纸预览';
+  frame.style.cssText = 'width:100%;height:70vh;border:0';
+
+  async function onReady(event) {
+    if (event.origin !== viewerOrigin || event.source !== frame.contentWindow ||
+        event.data?.type !== 'DWG_VIEWER_READY') return;
+    window.removeEventListener('message', onReady);
+    const res = await fetch('/api/drawings/123/content');
+    if (!res.ok) throw new Error('文件读取失败 ' + res.status);
+    const buffer = await res.arrayBuffer();
+    frame.contentWindow.postMessage(
+      { type: 'LOAD_DWG_BUFFER', fileName: 'sample.dwg', buffer },
+      viewerOrigin, [buffer]
+    );
   }
-});
-
-watch(
-  () => props.minioFileUrl,
-  (newUrl) => {
-    if (newUrl) void loadDwg(newUrl);
-  }
-);
+  window.addEventListener('message', onReady);
+  frame.src = viewerOrigin + '/';
+  document.getElementById('drawing-host').append(frame);
 </script>
-
-<style scoped>
-.dwg-viewer-wrapper {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  height: 100%;
-  background: #0b0e17;
-  color: #f1f5f9;
-}
-.toolbar {
-  height: 44px;
-  padding: 0 12px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  background: #0f1624;
-  border-bottom: 1px solid #1e293b;
-}
-.viewport-canvas {
-  flex: 1;
-  position: relative;
-  overflow: hidden;
-}
-.error {
-  color: #fb7185;
-}
-</style>
 ```
 
----
-
-### 4. 接入方式 B：独立部署并通过 `<iframe>` 嵌入现有 Vue 页面
-
-如果不希望在主工程中引入 `@mlightcad/*` 与 WASM 构建配置，可直接将本工程打包（`npm run build`）作为独立静态子服务部署，在 Vue 页面中通过 `<iframe>` 集成：
-
-1. **通过 URL 参数直接指定 MinIO 地址**：
-   ```html
-   <iframe
-     src="/dwg-viewer/index.html?url=https%3A%2F%2Fminio.internal%2Fbucket%2Fsite-plan.dwg"
-     style="width: 100%; height: 100%; border: none;"
-   ></iframe>
-   ```
-2. **通过 `postMessage` 动态传递带鉴权 Header 的地址或二进制流**：
-   ```ts
-   // Vue 父页面调用：
-   iframeRef.value?.contentWindow?.postMessage(
-     {
-       type: 'LOAD_DWG_URL',
-       url: 'https://api.internal/spring/files/dwg/1024',
-       fileName: '总平图.dwg',
-       headers: { Authorization: `Bearer ${jwtToken}` },
-     },
-     '*'
-   );
-   ```
-
----
+**迁移验收**：先用仓库的 canteen.dwg 替代业务接口的返回内容，检查出现图纸名、画布可缩放且字体与 WASM 请求成功；再切回实际业务接口，用分别有权和无权的账号验证授权。同源 Vue 组件和跨来源 iframe 均已在本机 Chrome 用该样图完成加载。具体业务系统的登录、代理、缓存隔离和部署策略须在目标环境验收。
 
 ## 五、已解决的渲染细节问题 & 后续待办 (TODO)
 
@@ -375,7 +276,7 @@ watch(
 
 ### 已落地的双层 Gzip 缓存引擎（L1 浏览器 IndexedDB + L2 服务端磁盘）
 1. **DWG 指纹计算 (`computeDwgFingerprint`)**：对 DWG 二进制流采样（头 64KB + 中部 64KB + 尾 64KB + 文件字节长度）计算 FNV-1a 64-bit 指纹（如 `dwg-v1-a8d08bf36d57fb06-226576`），耗时 `< 1ms`。
-2. **DWG 中间 JSON 瘦身 (`stripDwgDatabaseForCache`)**：自动剔除 `@mlightcad/libredwg-web` 在顶层 `db.entities` 与 `BLOCK_RECORD.entities` 之间重复生成的冗余模型空间实体引用及无用 `xdata`，在零损画质前提下将序列化 JSON 体积缩减约 `45%`~`55%`。
+2. **DWG 中间 JSON 瘦身 (`stripDwgDatabaseForCache`)**：自动剔除 `@mlightcad/libredwg-web` 在顶层 `db.entities` 与 `BLOCK_RECORD.entities` 之间重复生成的冗余模型空间实体引用及无用 `xdata`，减少序列化体积，收益随图纸内容而异。
 3. **双层 Gzip 缓存读写 (`src/utils/dwgGzipCache.ts` + `src/utils/dwgLocalCacheStore.ts` + `server.ts`)**：
    - **L1 浏览器本地缓存**：基于 Web 原生 `CompressionStream('gzip')` / `DecompressionStream('gzip')` 与 `IndexedDB`，单机二次打开跳过 `libredwg-web.wasm` 二进制解码。
    - **L2 服务端共享缓存 (`/api/dwg-cache/:fingerprint`)**：服务端将 `.dwg.json.gz` 与 `.meta.json` 持久化在 `.cache/dwg-gzip/` 目录，桌面生产环境使用用户目录下的缓存。再次打开时可读取 L2 并回填本地 L1，减少重复解析。
